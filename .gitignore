@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+backend/storage/glb/*
+backend/storage/audio/*
+!backend/storage/glb/.gitkeep
+!backend/storage/audio/.gitkeep
+web-client/node_modules/
+web-client/dist/
+.conda/
