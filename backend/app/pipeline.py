@@ -18,15 +18,6 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 
-_model_version_counter = 0
-
-
-def _next_model_version() -> int:
-    """Generate a monotonically increasing model version for cache-busting."""
-    global _model_version_counter
-    _model_version_counter += 1
-    return _model_version_counter
-
 
 def _glb_url(settings: Settings, model_id: str) -> str:
     return f"/media/glb/{model_id}.glb"
@@ -262,10 +253,9 @@ async def apply_intent(
     audio_url, tts_ms = await synthesize_speech(intent.reply, settings)
     latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
 
-    # Always include model_id and version when rebuilt is True
-    # Client MUST receive these to know it needs to swap the mesh
+    # Always include model_id when rebuilt is True
+    # Client uses fresh model_id + glb_url to know it needs to swap the mesh
     response_model_id = result_model_id if rebuilt else session.model_id
-    response_model_version = _next_model_version() if rebuilt else None
 
     return CommandResponse(
         ok=error_msg is None,
@@ -276,7 +266,6 @@ async def apply_intent(
         color=session.color,
         glb_url=session.glb_url,
         model_id=response_model_id,
-        model_version=response_model_version,
         reply_audio_url=audio_url,
         session=session,
         latency_ms=latency,
@@ -315,7 +304,6 @@ async def execute_script_direct(
             color=color,
             glb_url=session.glb_url,
             model_id=model_id,
-            model_version=_next_model_version(),
             reply_audio_url=None,
             session=session,
             latency_ms=latency,
@@ -330,7 +318,6 @@ async def execute_script_direct(
             color=session.color,
             glb_url=session.glb_url,
             model_id=None,
-            model_version=None,
             reply_audio_url=None,
             session=session,
             latency_ms=latency,
