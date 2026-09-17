@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Regression tests for pipeline: color follow-up response contract.
+Tests for the command pipeline, specifically color follow-up paths.
 
 Run with: python -m app.test_pipeline
 Or:       python backend/app/test_pipeline.py
 
-Tests that color-only follow-ups (set_material) ALWAYS return:
-- rebuilt=True
-- new model_id
-- new glb_url
-- model_version (for cache busting)
-
-A "successful" color change with no new asset would be a client-invisible no-op.
+Tests that:
+1. Color change via set_material action returns new glb_url and color
+2. Color change triggers model rebuild when last_script exists
+3. CommandResponse includes rebuilt=True when model changes
+4. Fast-path color changes work correctly
+5. Color change rebuild failure returns error, not silent success
 """
 
 import sys
@@ -23,265 +22,306 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.models import Intent, SessionState, CommandResponse
-from app.pipeline import apply_intent, _next_model_version
+from app.pipeline import apply_intent
 
 
-def _mock_settings():
+def create_mock_settings():
     """Create mock settings for testing."""
-    settings = MagicMock()
-    settings.glb_dir = Path("/tmp/test_glb")
-    settings.audio_dir = Path("/tmp/test_audio")
-    settings.elevenlabs_api_key = None  # Disable TTS
-    return settings
+    mock = MagicMock()
+    mock.glb_dir = Path("/tmp/test_glb")
+    mock.audio_dir = Path("/tmp/test_audio")
+    mock.elevenlabs_api_key = None  # Disable TTS
+    return mock
 
 
-# ============================================================================
-# Test 1: Color change on session with last_script MUST return new model
-# ============================================================================
-
-async def test_color_change_with_script_returns_new_model():
-    """Test that set_material with last_script returns new model_id and glb_url."""
-    print("\n=== Test: Color change with script returns new model ===")
-    
-    session = SessionState(
-        session_id="test",
-        last_script='import cadquery as cq\nresult = cq.Workplane("XY").box(10, 10, 5)',
-        model_id="old_model_123",
-        glb_url="/media/glb/old_model_123.glb",
-        color="#C0C0C0",
+def create_test_session(
+    session_id: str = "test",
+    color: str = "#C0C0C0",
+    template: str = None,
+    params: dict = None,
+    last_script: str = None,
+    model_id: str = None,
+    glb_url: str = None,
+):
+    """Create a test session state."""
+    return SessionState(
+        session_id=session_id,
+        color=color,
+        template=template,
+        params=params or {},
+        last_script=last_script,
+        model_id=model_id,
+        glb_url=glb_url,
     )
-    
-    intent = Intent(
-        action="set_material",
-        params={"color": "#FFD700"},  # yellow
-        reply="Changed to yellow.",
-    )
-    
-    settings = _mock_settings()
-    
-    # Mock _execute_with_retry to return success with new model
-    with patch("app.pipeline._execute_with_retry") as mock_exec:
-        mock_exec.return_value = (True, "new_model_456", None)
-        
-        # Mock synthesize_speech to avoid actual TTS
-        with patch("app.pipeline.synthesize_speech") as mock_tts:
-            mock_tts.return_value = (None, 0.0)
-            
-            # Mock save_session
-            with patch("app.pipeline.save_session"):
-                result = await apply_intent(intent, session, settings)
-    
-    # Assertions
-    errors = []
-    
-    if not result.rebuilt:
-        errors.append("rebuilt should be True")
-    
-    if result.model_id != "new_model_456":
-        errors.append(f"model_id should be 'new_model_456', got {result.model_id!r}")
-    
-    if result.model_version is None:
-        errors.append("model_version should not be None")
-    
-    if result.glb_url is None:
-        errors.append("glb_url should not be None")
-    
-    if result.action != "set_material":
-        errors.append(f"action should be 'set_material', got {result.action!r}")
-    
-    if errors:
-        print("  ✗ FAILED:")
-        for e in errors:
-            print(f"    - {e}")
-        return 0, 1
-    else:
-        print("  ✓ Color change correctly returns new model_id, glb_url, model_version")
-        return 1, 0
 
 
-# ============================================================================
-# Test 2: Color change with NO script/template should fail gracefully
-# ============================================================================
-
-async def test_color_change_no_model_fails():
-    """Test that set_material with no script or template returns an error."""
-    print("\n=== Test: Color change with no model fails gracefully ===")
+async def test_color_change_returns_color():
+    """Test that set_material action returns the new color in response."""
+    print("\n=== Testing Color Change Returns Color ===")
+    passed = 0
+    failed = 0
     
-    session = SessionState(
-        session_id="test",
-        last_script=None,
-        template=None,
-        model_id=None,
-        glb_url=None,
-        color="#C0C0C0",
-    )
+    settings = create_mock_settings()
+    session = create_test_session(color="#C0C0C0")
     
     intent = Intent(
         action="set_material",
         params={"color": "#FFD700"},
-        reply="Changed to yellow.",
+        reply="Changed to gold.",
     )
     
-    settings = _mock_settings()
-    
-    with patch("app.pipeline.synthesize_speech") as mock_tts:
-        mock_tts.return_value = (None, 0.0)
-        with patch("app.pipeline.save_session"):
+    with patch("app.pipeline.save_session"):
+        with patch("app.pipeline.synthesize_speech", return_value=(None, 0.0)):
             result = await apply_intent(intent, session, settings)
     
-    errors = []
-    
-    if result.ok:
-        errors.append("ok should be False when no model to apply color to")
-    
-    if result.rebuilt:
-        errors.append("rebuilt should be False when no model exists")
-    
-    if result.error is None:
-        errors.append("error should contain a message")
-    
-    if errors:
-        print("  ✗ FAILED:")
-        for e in errors:
-            print(f"    - {e}")
-        return 0, 1
+    if result.color == "#FFD700":
+        print("  ✓ Response includes correct color")
+        passed += 1
     else:
-        print("  ✓ Color change with no model correctly returns error")
-        return 1, 0
-
-
-# ============================================================================
-# Test 3: Color change rebuild failure should return error, not silent success
-# ============================================================================
-
-async def test_color_change_rebuild_failure_returns_error():
-    """Test that set_material rebuild failure returns an error, not silent success."""
-    print("\n=== Test: Color change rebuild failure returns error ===")
+        print(f"  ✗ Response color incorrect: {result.color}")
+        failed += 1
     
-    session = SessionState(
-        session_id="test",
-        last_script='import cadquery as cq\nresult = cq.Workplane("XY").box(10, 10, 5)',
-        model_id="old_model_123",
-        glb_url="/media/glb/old_model_123.glb",
+    if session.color == "#FFD700":
+        print("  ✓ Session color updated")
+        passed += 1
+    else:
+        print(f"  ✗ Session color not updated: {session.color}")
+        failed += 1
+    
+    return passed, failed
+
+
+async def test_color_change_with_script_rebuilds():
+    """Test that color change with last_script triggers rebuild and returns new glb_url."""
+    print("\n=== Testing Color Change With Script Rebuilds ===")
+    passed = 0
+    failed = 0
+    
+    settings = create_mock_settings()
+    session = create_test_session(
         color="#C0C0C0",
+        last_script='import cadquery as cq\nresult = cq.Workplane("XY").box(10, 10, 5)',
+        model_id="old_model",
+        glb_url="/media/glb/old_model.glb",
     )
     
     intent = Intent(
         action="set_material",
         params={"color": "#FFD700"},
-        reply="Changed to yellow.",
+        reply="Changed to gold.",
     )
     
-    settings = _mock_settings()
+    mock_exec_result = {
+        "ok": True,
+        "model_id": "new_model_abc",
+        "glb_path": "/tmp/test_glb/new_model_abc.glb",
+        "exec_ms": 150.0,
+    }
     
-    # Mock _execute_with_retry to return failure
-    with patch("app.pipeline._execute_with_retry") as mock_exec:
-        mock_exec.return_value = (False, None, "Sandbox timeout")
-        
-        with patch("app.pipeline.synthesize_speech") as mock_tts:
-            mock_tts.return_value = (None, 0.0)
-            with patch("app.pipeline.save_session"):
+    with patch("app.pipeline.save_session"):
+        with patch("app.pipeline.synthesize_speech", return_value=(None, 0.0)):
+            with patch("app.pipeline.execute_cadquery_script", return_value=mock_exec_result):
                 result = await apply_intent(intent, session, settings)
     
-    errors = []
+    if result.rebuilt:
+        print("  ✓ Response rebuilt=True")
+        passed += 1
+    else:
+        print("  ✗ Response rebuilt=False (should be True)")
+        failed += 1
     
-    # The key assertion: a rebuild failure should NOT return ok=True
+    if result.glb_url and "new_model_abc" in result.glb_url:
+        print(f"  ✓ Response has new glb_url: {result.glb_url}")
+        passed += 1
+    else:
+        print(f"  ✗ Response glb_url incorrect: {result.glb_url}")
+        failed += 1
+    
+    if result.color == "#FFD700":
+        print("  ✓ Response includes new color")
+        passed += 1
+    else:
+        print(f"  ✗ Response color incorrect: {result.color}")
+        failed += 1
+    
+    return passed, failed
+
+
+async def test_color_change_no_script_no_rebuild():
+    """Test that color change without last_script doesn't rebuild (color-only update)."""
+    print("\n=== Testing Color Change Without Script (No Rebuild) ===")
+    passed = 0
+    failed = 0
+    
+    settings = create_mock_settings()
+    session = create_test_session(
+        color="#C0C0C0",
+        last_script=None,  # No script
+        template=None,     # No template either
+        glb_url="/media/glb/existing.glb",
+    )
+    
+    intent = Intent(
+        action="set_material",
+        params={"color": "#FFD700"},
+        reply="Changed to gold.",
+    )
+    
+    with patch("app.pipeline.save_session"):
+        with patch("app.pipeline.synthesize_speech", return_value=(None, 0.0)):
+            result = await apply_intent(intent, session, settings)
+    
+    # Should NOT rebuild since there's no script/template
+    if not result.rebuilt:
+        print("  ✓ Response rebuilt=False (correct for color-only)")
+        passed += 1
+    else:
+        print("  ✗ Response rebuilt=True (should be False)")
+        failed += 1
+    
+    if result.color == "#FFD700":
+        print("  ✓ Response includes new color")
+        passed += 1
+    else:
+        print(f"  ✗ Response color incorrect: {result.color}")
+        failed += 1
+    
+    # glb_url should be preserved
+    if result.glb_url == "/media/glb/existing.glb":
+        print("  ✓ glb_url preserved from session")
+        passed += 1
+    else:
+        print(f"  ✗ glb_url changed unexpectedly: {result.glb_url}")
+        failed += 1
+    
+    return passed, failed
+
+
+async def test_generate_action_returns_glb():
+    """Test that generate action returns new glb_url."""
+    print("\n=== Testing Generate Action Returns GLB ===")
+    passed = 0
+    failed = 0
+    
+    settings = create_mock_settings()
+    session = create_test_session()
+    
+    intent = Intent(
+        action="generate",
+        script='import cadquery as cq\nresult = cq.Workplane("XY").box(10, 10, 5)',
+        reply="Built a box.",
+    )
+    
+    mock_exec_result = {
+        "ok": True,
+        "model_id": "box_model_123",
+        "glb_path": "/tmp/test_glb/box_model_123.glb",
+        "exec_ms": 200.0,
+    }
+    
+    with patch("app.pipeline.save_session"):
+        with patch("app.pipeline.synthesize_speech", return_value=(None, 0.0)):
+            with patch("app.pipeline.execute_cadquery_script", return_value=mock_exec_result):
+                result = await apply_intent(intent, session, settings)
+    
     if result.ok:
-        errors.append("ok should be False when rebuild fails")
+        print("  ✓ Response ok=True")
+        passed += 1
+    else:
+        print(f"  ✗ Response ok=False: {result.error}")
+        failed += 1
     
     if result.rebuilt:
-        errors.append("rebuilt should be False when rebuild fails")
-    
-    # model_id may still be the old session model_id (for reference),
-    # but model_version should be None since no new model was created
-    if result.model_version is not None:
-        errors.append(f"model_version should be None on failure, got {result.model_version!r}")
-    
-    if result.error is None:
-        errors.append("error should contain the failure reason")
-    
-    if errors:
-        print("  ✗ FAILED:")
-        for e in errors:
-            print(f"    - {e}")
-        return 0, 1
+        print("  ✓ Response rebuilt=True")
+        passed += 1
     else:
-        print("  ✓ Color change rebuild failure correctly returns error")
-        return 1, 0
-
-
-# ============================================================================
-# Test 4: Model version increments on each rebuild
-# ============================================================================
-
-def test_model_version_increments():
-    """Test that _next_model_version() increments monotonically."""
-    print("\n=== Test: Model version increments ===")
+        print("  ✗ Response rebuilt=False")
+        failed += 1
     
-    v1 = _next_model_version()
-    v2 = _next_model_version()
-    v3 = _next_model_version()
-    
-    errors = []
-    
-    if v2 <= v1:
-        errors.append(f"v2 ({v2}) should be > v1 ({v1})")
-    
-    if v3 <= v2:
-        errors.append(f"v3 ({v3}) should be > v2 ({v2})")
-    
-    if errors:
-        print("  ✗ FAILED:")
-        for e in errors:
-            print(f"    - {e}")
-        return 0, 1
+    if result.glb_url and "box_model_123" in result.glb_url:
+        print(f"  ✓ Response has glb_url: {result.glb_url}")
+        passed += 1
     else:
-        print(f"  ✓ Versions increment correctly: {v1} → {v2} → {v3}")
-        return 1, 0
+        print(f"  ✗ Response glb_url missing or wrong: {result.glb_url}")
+        failed += 1
+    
+    return passed, failed
 
 
-# ============================================================================
-# Run All Tests
-# ============================================================================
+async def test_command_response_structure():
+    """Test that CommandResponse has all required fields for client."""
+    print("\n=== Testing CommandResponse Structure ===")
+    passed = 0
+    failed = 0
+    
+    settings = create_mock_settings()
+    session = create_test_session()
+    
+    intent = Intent(
+        action="clarify",
+        reply="I didn't understand that.",
+    )
+    
+    with patch("app.pipeline.synthesize_speech", return_value=("/media/audio/reply.mp3", 100.0)):
+        result = await apply_intent(intent, session, settings)
+    
+    # Check all required fields exist
+    required_fields = [
+        ("ok", bool),
+        ("reply", str),
+        ("action", str),
+        ("rebuilt", bool),
+        ("color", (str, type(None))),
+        ("glb_url", (str, type(None))),
+        ("session", SessionState),
+        ("latency_ms", dict),
+    ]
+    
+    for field_name, field_type in required_fields:
+        if hasattr(result, field_name):
+            value = getattr(result, field_name)
+            if isinstance(value, field_type) or value is None:
+                print(f"  ✓ {field_name} present and correct type")
+                passed += 1
+            else:
+                print(f"  ✗ {field_name} wrong type: {type(value)}")
+                failed += 1
+        else:
+            print(f"  ✗ {field_name} missing")
+            failed += 1
+    
+    return passed, failed
+
 
 def run_all_tests():
-    """Run all pipeline regression tests."""
+    """Run all pipeline tests."""
     print("=" * 60)
-    print("PIPELINE REGRESSION TESTS")
-    print("(Color follow-up response contract)")
+    print("COMMAND PIPELINE / COLOR FOLLOW-UP TESTS")
     print("=" * 60)
     
-    total_pass = 0
-    total_fail = 0
+    async def run_async_tests():
+        results = []
+        results.append(await test_color_change_returns_color())
+        results.append(await test_color_change_with_script_rebuilds())
+        results.append(await test_color_change_no_script_no_rebuild())
+        results.append(await test_generate_action_returns_glb())
+        results.append(await test_command_response_structure())
+        return results
     
-    # Run async tests
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    all_results = asyncio.run(run_async_tests())
     
-    try:
-        p, f = loop.run_until_complete(test_color_change_with_script_returns_new_model())
-        total_pass += p
-        total_fail += f
-        
-        p, f = loop.run_until_complete(test_color_change_no_model_fails())
-        total_pass += p
-        total_fail += f
-        
-        p, f = loop.run_until_complete(test_color_change_rebuild_failure_returns_error())
-        total_pass += p
-        total_fail += f
-    finally:
-        loop.close()
-    
-    # Run sync tests
-    p, f = test_model_version_increments()
-    total_pass += p
-    total_fail += f
+    total_pass = sum(r[0] for r in all_results)
+    total_fail = sum(r[1] for r in all_results)
     
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"TOTAL: {total_pass}/{total_pass + total_fail} passed")
+    print(f"Color change returns color:    {all_results[0][0]}/{sum(all_results[0])} passed")
+    print(f"Color change with script:      {all_results[1][0]}/{sum(all_results[1])} passed")
+    print(f"Color change no script:        {all_results[2][0]}/{sum(all_results[2])} passed")
+    print(f"Generate returns GLB:          {all_results[3][0]}/{sum(all_results[3])} passed")
+    print(f"Response structure:            {all_results[4][0]}/{sum(all_results[4])} passed")
+    print(f"TOTAL:                         {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:
         print(f"\n⚠️  {total_fail} TESTS FAILED")

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 PERCY_ALIASES = re.compile(
-    r"^\s*(?:mercy|merci|percy|see|i see|pc|purse|perce|persey|piercy|pursee)[,.\s]*",
+    r"^\s*(?:i\s+see|pursee|persey|piercy|mercy|merci|percy|perce|purse|see|pc)[,.\s]*",
     re.IGNORECASE,
 )
 
