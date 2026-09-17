@@ -83,12 +83,18 @@ ALLOWED_MODULES = frozenset([
 ])
 
 ALLOWED_CADQUERY_ATTRS = frozenset([
+    # Core geometry classes
     "Workplane",
+    "CQ",  # Alias for Workplane used in some scripts
     "Assembly",
     "Sketch",
+    # Primitive types
     "Vector",
     "Location",
     "Plane",
+    "Matrix",
+    "BoundBox",
+    # Shape types
     "Solid",
     "Shell",
     "Face",
@@ -97,7 +103,17 @@ ALLOWED_CADQUERY_ATTRS = frozenset([
     "Vertex",
     "Shape",
     "Compound",
+    # Utilities
     "Color",
+    # Selection helpers (used for .faces(">Z") style selectors)
+    "selectors",
+    "StringSyntaxSelector",
+    "DirectionSelector",
+    "DirectionMinMaxSelector",
+    "NearestToPointSelector",
+    "TypeSelector",
+    "ParallelDirSelector",
+    "PerpendicularDirSelector",
 ])
 
 
@@ -164,8 +180,8 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     """Restricted import that ONLY allows explicitly allowlisted modules."""
     base_module = name.split(".")[0]
 
-    if base_module not in ALLOWED_MODULES:
-        raise SecurityError(f"Import of '{name}' is not allowed in sandbox (allowlist: {', '.join(sorted(ALLOWED_MODULES))})")
+    if base_module not in ALLOWED_IMPORT_MODULES:
+        raise SecurityError(f"Import of '{name}' is not allowed in sandbox (allowlist: {', '.join(sorted(ALLOWED_IMPORT_MODULES))})")
 
     import importlib
     return importlib.import_module(name)
