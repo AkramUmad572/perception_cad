@@ -46,19 +46,38 @@ Or if you need clarification:
 4. Default to reasonable sizes (10-50mm) unless user specifies
 5. Code must be syntactically valid Python
 
-## CadQuery Examples
+## SANDBOX SECURITY RULES — CRITICAL
+Scripts run in a restricted sandbox. ONLY use the patterns below or the script will fail.
+
+### ALLOWED operations:
+- Import: `import cadquery as cq` and `import math` ONLY
+- Entry point: `cq.Workplane("XY")` / `cq.Workplane("XZ")` / `cq.Workplane("YZ")`
+- 2D sketching: .circle(), .rect(), .polygon(), .polyline(), .close(), .text()
+- 3D operations: .box(), .cylinder(), .sphere(), .extrude(), .loft(), .revolve()
+- Subtractive: .cut(), .hole()
+- Edge/face ops: .fillet(), .chamfer(), .edges(), .faces(), .workplane()
+- Boolean: .union(), .cut(), .intersect() via Workplane methods
+- Selectors: .faces(">Z"), .edges("|Z"), etc. for selecting geometry
+- Variables: plain Python variables for dimensions, lists for polyline points
+- Math: math.pi, math.sin, math.cos, math.sqrt, etc.
+- Loops: for/while for generating point lists
+
+### FORBIDDEN — will trigger SECURITY error:
+- getattr, setattr, delattr, hasattr
+- type(), object, vars(), dir(), globals(), locals()
+- __import__, importlib, exec, eval, compile
+- open(), file operations, pathlib, os, sys
+- Network: socket, urllib, requests, http
+- Any module not in [math, cadquery]
+- Accessing cq internals: cq.occ_impl, cq.selectors internals, __class__, __bases__
+- Dynamic attribute access or introspection tricks
+
+## CadQuery Examples (sandbox-safe patterns only)
 
 Simple box:
 ```python
 import cadquery as cq
 result = cq.Workplane("XY").box(30, 20, 10)
-```
-
-Ring/torus:
-```python
-import cadquery as cq
-outer_r, inner_r, height = 11, 9, 4
-result = cq.Workplane("XY").circle(outer_r).circle(inner_r).extrude(height)
 ```
 
 Cylinder:
@@ -73,13 +92,20 @@ import cadquery as cq
 result = cq.Workplane("XY").sphere(20)
 ```
 
-Cone:
+Ring (hollow cylinder):
+```python
+import cadquery as cq
+outer_r, inner_r, height = 11, 9, 4
+result = cq.Workplane("XY").circle(outer_r).extrude(height).faces(">Z").workplane().hole(inner_r * 2)
+```
+
+Cone (via loft):
 ```python
 import cadquery as cq
 result = cq.Workplane("XY").circle(20).workplane(offset=30).circle(0.1).loft()
 ```
 
-Pyramid:
+Pyramid (via loft):
 ```python
 import cadquery as cq
 result = cq.Workplane("XY").rect(30, 30).workplane(offset=25).rect(1, 1).loft()
@@ -91,7 +117,33 @@ import cadquery as cq
 result = cq.Workplane("XY").polygon(6, 20).extrude(15)
 ```
 
-Star shape:
+Box with hole:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(30, 30, 20).faces(">Z").workplane().hole(10)
+```
+
+Rounded box (fillet all edges):
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(30, 20, 15).edges().fillet(3)
+```
+
+Chamfered box:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(25, 25, 12).edges().chamfer(2)
+```
+
+Keychain (plate + hole + fillet + text):
+```python
+import cadquery as cq
+plate = cq.Workplane("XY").box(50, 25, 4).edges("|Z").fillet(3)
+with_hole = plate.faces(">Z").workplane().center(20, 0).hole(5)
+result = with_hole.faces(">Z").workplane().center(-5, 0).text("KEY", 8, 1)
+```
+
+Star shape (using polyline with math):
 ```python
 import cadquery as cq
 import math
@@ -101,24 +153,6 @@ for i in range(10):
     r = 20 if i % 2 == 0 else 10
     pts.append((r * math.cos(angle), r * math.sin(angle)))
 result = cq.Workplane("XY").polyline(pts).close().extrude(5)
-```
-
-Box with hole:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").box(30, 30, 20).faces(">Z").workplane().hole(10)
-```
-
-Rounded box (fillet):
-```python
-import cadquery as cq
-result = cq.Workplane("XY").box(30, 20, 15).edges().fillet(3)
-```
-
-Text extrusion:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").text("Hi", 10, 3)
 ```
 
 Gear-like shape:
@@ -155,6 +189,12 @@ for t_int in range(100):
 result = cq.Workplane("XY").polyline(pts).close().extrude(5)
 ```
 
+Text extrusion:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").text("Hi", 10, 3)
+```
+
 ## Color Handling
 For "make it yellow", "change color to blue", etc:
 - action: "set_material"
@@ -180,7 +220,22 @@ Original script:
 {script}
 ```
 
-Fix the script to resolve the error. Common issues:
+Fix the script to resolve the error.
+
+## If error is SECURITY-related (blocked import, blocked builtin, access denied):
+The sandbox only allows these patterns:
+- Imports: ONLY `import cadquery as cq` and `import math`
+- Entry: `cq.Workplane("XY")`, `cq.Workplane("XZ")`, `cq.Workplane("YZ")`
+- 2D: .circle(), .rect(), .polygon(), .polyline(), .close(), .text()
+- 3D: .box(), .cylinder(), .sphere(), .extrude(), .loft(), .revolve()
+- Subtractive: .cut(), .hole()
+- Edges/faces: .fillet(), .chamfer(), .edges(), .faces(), .workplane()
+- Boolean: .union(), .cut(), .intersect() via Workplane methods
+- FORBIDDEN: getattr, setattr, type, object, __import__, exec, eval, open, os, sys, importlib, pathlib, any introspection
+
+Rewrite using ONLY the allowed patterns above. Do NOT try workarounds.
+
+## Other common issues:
 - Syntax errors: check parentheses, quotes, indentation
 - Invalid operations: some CadQuery methods don't work on all shapes
 - Division issues: ensure no division by zero
