@@ -55,6 +55,8 @@ class CommandResponse(BaseModel):
     rebuilt: bool = False
     color: str | None = None
     glb_url: str | None = None
+    model_id: str | None = None
+    model_version: int | None = None
     reply_audio_url: str | None = None
     session: SessionState
     latency_ms: dict[str, float] = Field(default_factory=dict)

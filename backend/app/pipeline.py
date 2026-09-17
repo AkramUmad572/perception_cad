@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 
+_model_version_counter = 0
+
+
+def _next_model_version() -> int:
+    """Generate a monotonically increasing model version for cache-busting."""
+    global _model_version_counter
+    _model_version_counter += 1
+    return _model_version_counter
+
 
 def _glb_url(settings: Settings, model_id: str) -> str:
     return f"/media/glb/{model_id}.glb"
@@ -100,14 +109,19 @@ async def apply_intent(
     
     Handles:
     - generate: Execute CadQuery script via sandbox (with retry loop)
-    - set_material: Change color (optionally rebuild)
+    - set_material: Change color AND ALWAYS rebuild to return fresh model_id/glb_url
     - create/modify: Legacy template path (kept for backward compat)
     - clarify/noop: No CAD action
+    
+    IMPORTANT: For any action that changes the model (generate, set_material, modify),
+    we MUST return a new model_id and glb_url so the client can swap the mesh.
+    A "successful" color change with no new asset would be a client-invisible no-op.
     """
     latency: dict[str, float] = dict(extra_latency or {})
     rebuilt = False
     action = intent.action
     error_msg = None
+    result_model_id: str | None = None
 
     if action == "generate":
         if not intent.script:
@@ -123,6 +137,7 @@ async def apply_intent(
             )
             if success:
                 rebuilt = True
+                result_model_id = model_id
             else:
                 error_msg = error
                 intent.reply = f"Build failed: {error}"
@@ -142,6 +157,7 @@ async def apply_intent(
             )
             if success:
                 rebuilt = True
+                result_model_id = model_id
             else:
                 error_msg = error
                 intent.reply = f"Script failed: {error}"
@@ -162,6 +178,7 @@ async def apply_intent(
                 session.glb_url = _glb_url(settings, model_id)
                 session.last_script = None
                 rebuilt = True
+                result_model_id = model_id
                 save_session(session)
             except Exception as e:
                 logger.exception("Legacy build failed: %s", e)
@@ -186,6 +203,7 @@ async def apply_intent(
                 session.model_id = model_id
                 session.glb_url = _glb_url(settings, model_id)
                 rebuilt = True
+                result_model_id = model_id
                 save_session(session)
             except Exception as e:
                 logger.exception("Modify failed: %s", e)
@@ -198,7 +216,12 @@ async def apply_intent(
         session.color = color
         session.params["color"] = color
         
+        # CRITICAL: Always rebuild to return a new model_id/glb_url.
+        # A "successful" set_material with no new asset is a client no-op.
+        rebuild_attempted = False
+        
         if session.last_script:
+            rebuild_attempted = True
             success, model_id, error = await _execute_with_retry(
                 script=session.last_script,
                 original_text="rebuild with new color",
@@ -208,7 +231,13 @@ async def apply_intent(
             )
             if success:
                 rebuilt = True
+                result_model_id = model_id
+            else:
+                # Color change requested but rebuild failed - this is an error
+                error_msg = f"Color change failed: {error}"
+                intent.reply = f"Couldn't apply color: {error}"
         elif session.template and session.template in DEFAULTS:
+            rebuild_attempted = True
             try:
                 params = merge_params(session.template, session.params)
                 model_id, _, build_ms = build_model(session.template, params, settings)
@@ -216,13 +245,27 @@ async def apply_intent(
                 session.model_id = model_id
                 session.glb_url = _glb_url(settings, model_id)
                 rebuilt = True
+                result_model_id = model_id
             except Exception as e:
                 logger.warning("Rebuild for color failed: %s", e)
+                error_msg = f"Color change failed: {e}"
+                intent.reply = f"Couldn't apply color: {e}"
+        
+        if not rebuild_attempted:
+            # No script or template to rebuild - cannot apply color to nothing
+            error_msg = "No model to apply color to. Build something first."
+            intent.reply = error_msg
+        
         save_session(session)
 
     t0 = time.perf_counter()
     audio_url, tts_ms = await synthesize_speech(intent.reply, settings)
     latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
+
+    # Always include model_id and version when rebuilt is True
+    # Client MUST receive these to know it needs to swap the mesh
+    response_model_id = result_model_id if rebuilt else session.model_id
+    response_model_version = _next_model_version() if rebuilt else None
 
     return CommandResponse(
         ok=error_msg is None,
@@ -232,6 +275,8 @@ async def apply_intent(
         rebuilt=rebuilt,
         color=session.color,
         glb_url=session.glb_url,
+        model_id=response_model_id,
+        model_version=response_model_version,
         reply_audio_url=audio_url,
         session=session,
         latency_ms=latency,
@@ -269,6 +314,8 @@ async def execute_script_direct(
             rebuilt=True,
             color=color,
             glb_url=session.glb_url,
+            model_id=model_id,
+            model_version=_next_model_version(),
             reply_audio_url=None,
             session=session,
             latency_ms=latency,
@@ -282,6 +329,8 @@ async def execute_script_direct(
             rebuilt=False,
             color=session.color,
             glb_url=session.glb_url,
+            model_id=None,
+            model_version=None,
             reply_audio_url=None,
             session=session,
             latency_ms=latency,

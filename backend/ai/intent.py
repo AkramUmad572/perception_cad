@@ -266,13 +266,94 @@ _STT_FIXES = [
     (r"\byello\b", "yellow"), (r"\bmellow\b", "yellow"),
 ]
 
+# STT false wake-word patterns: "Mercy", "See", "I see" misheard before "Percy"
+# These appear at the start of transcripts as garbage prefixes.
+# We either normalize them to "Percy" (if followed by command) or strip them.
+_WAKE_WORD_ALIASES = [
+    # "Mercy, can you..." → "Percy, can you..."
+    r"^mercy\b",
+    # "See, can you..." → "Percy, can you..." (but not "see" mid-sentence)
+    r"^see\b",
+    # "I see. Can you..." or "I see, can you..." → "Percy, can you..."
+    r"^i see[.,]?\s*",
+    # "Percy" itself is fine but sometimes doubled: "Percy Percy" → "Percy"
+    r"^percy[,.]?\s+percy\b",
+]
+
+
+def _normalize_wake_word(text: str) -> str:
+    """
+    Normalize STT garbage that appears before the wake word "Percy".
+    
+    Common STT mishearings:
+    - "Mercy, can you build me a box" → "Percy, can you build me a box"
+    - "See, can you make it yellow" → "can you make it yellow" (stripped)
+    - "I see. Can you build a ring" → "Can you build a ring" (stripped)
+    
+    Strategy:
+    1. If text starts with "Mercy", replace with "Percy" (closest mishearing)
+    2. If text starts with "See," or "I see." followed by a command, strip the prefix
+    3. If "Percy Percy", dedupe to single "Percy"
+    """
+    t = text.strip()
+    lower = t.lower()
+    
+    # "Mercy" → "Percy" (preserve case style if original was capitalized)
+    if lower.startswith("mercy"):
+        # Replace "Mercy" with "Percy" preserving the rest
+        if t[0].isupper():
+            t = "Percy" + t[5:]
+        else:
+            t = "percy" + t[5:]
+        return t.strip()
+    
+    # "Percy Percy" → "Percy"
+    match = re.match(r"^percy[,.]?\s+percy\b", lower)
+    if match:
+        # Keep just one "Percy" + rest of string after the double
+        t = "Percy" + t[match.end():]
+        return t.strip()
+    
+    # "See, can you..." or "See. Can you..." → strip "See" prefix
+    # Only if followed by something that looks like a command
+    match = re.match(r"^see[,.]?\s+", lower)
+    if match:
+        rest = t[match.end():]
+        # If rest looks like a command (starts with can/could/make/build/etc.)
+        rest_lower = rest.lower()
+        if any(rest_lower.startswith(w) for w in ["can ", "could ", "make ", "build ", "create ", "change ", "turn "]):
+            return rest
+    
+    # "I see. Can you..." or "I see, can you..." → strip "I see" prefix
+    match = re.match(r"^i see[,.]?\s*", lower)
+    if match:
+        rest = t[match.end():]
+        if rest:  # Don't return empty string
+            return rest
+    
+    return t
+
 
 def _normalize_transcript(text: str) -> str:
+    """
+    Normalize STT transcript before intent parsing.
+    
+    Steps:
+    1. Basic cleanup (whitespace normalization)
+    2. Wake-word normalization (Mercy/See/I see → Percy or stripped)
+    3. Common STT word fixes (bill me → build me, yello → yellow)
+    """
     t = text.strip()
     t = re.sub(r"\s+", " ", t)
+    
+    # First: normalize wake-word garbage
+    t = _normalize_wake_word(t)
+    
+    # Then: apply word-level STT fixes
     lower = t.lower()
     for pattern, repl in _STT_FIXES:
         lower = re.sub(pattern, repl, lower, flags=re.IGNORECASE)
+    
     return lower.strip()
 
 
