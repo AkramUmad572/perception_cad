@@ -9,8 +9,8 @@
 
 const FRAME_SIZE = 1280; // 80ms at 16kHz - matches OpenWakeWord expected input
 const SAMPLE_RATE = 16000;
-const DETECTION_THRESHOLD = 0.5;
-const COOLDOWN_MS = 1500; // Prevent rapid re-triggers
+const DETECTION_THRESHOLD = 0.35; // Lowered from 0.5 for better sensitivity
+const COOLDOWN_MS = 1200; // Reduced from 1500 to allow faster re-triggers
 
 export class WakeWordDetector {
   constructor(onWakeWord) {
@@ -179,7 +179,7 @@ export class WakeWordDetector {
   async _detectFallback(frame) {
     const sum = frame.reduce((a, b) => a + Math.abs(b), 0);
     const avg = sum / frame.length;
-    return avg > 0.15;
+    return avg > 0.10; // Lowered from 0.15 for better fallback sensitivity
   }
 
   stop() {

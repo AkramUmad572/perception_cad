@@ -9,10 +9,10 @@
  */
 
 const SAMPLE_RATE = 16000;
-const SILENCE_THRESHOLD = 0.01;
-const SILENCE_DURATION_MS = 1200;
-const MAX_LISTEN_MS = 10000;
-const MIN_AUDIO_MS = 400;
+const SILENCE_THRESHOLD = 0.008; // Lowered from 0.01 to be less aggressive at cutting
+const SILENCE_DURATION_MS = 1600; // Increased from 1200 to wait longer before cutting
+const MAX_LISTEN_MS = 15000; // Increased from 10000 for longer commands
+const MIN_AUDIO_MS = 600; // Increased from 400 to ensure we capture more speech
 
 export class VADListener {
   constructor() {

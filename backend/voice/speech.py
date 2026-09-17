@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 
@@ -12,7 +13,31 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
+
+PERCY_ALIASES = re.compile(
+    r"^\s*(?:mercy|merci|percy|see|i see|pc|purse|perce|persey|piercy|pursee)[,.\s]*",
+    re.IGNORECASE,
+)
+
+
+def normalize_wake_word(transcript: str) -> str:
+    """
+    Normalize common STT misrecognitions of 'Percy' at start of utterance.
+    
+    Maps: Mercy, Merci, See, I see, PC, purse, perce, persey, piercy → Percy
+    """
+    match = PERCY_ALIASES.match(transcript)
+    if match:
+        remainder = transcript[match.end():].strip()
+        if remainder:
+            return f"Percy, {remainder}"
+        return "Percy"
+    return transcript
+
 CAD_KEYTERMS = [
+    # Wake word and common misrecognitions
+    "Percy",
+    "percy",
     # Generic CAD/modeling verbs
     "build",
     "make",
@@ -33,6 +58,8 @@ CAD_KEYTERMS = [
     "blue",
     "red",
     "green",
+    "gold",
+    "golden",
 ]
 
 
@@ -88,6 +115,7 @@ async def _elevenlabs_stt(
                         continue
                     resp.raise_for_status()
                     transcript = (resp.json().get("text") or "").strip()
+                    transcript = normalize_wake_word(transcript)
                     logger.info("STT(%s): %r", model_id, transcript)
                     return transcript
                 except Exception as exc:
@@ -134,6 +162,7 @@ async def transcribe_audio(
                 .get("transcript", "")
                 .strip()
             )
+            transcript = normalize_wake_word(transcript)
             logger.info("STT(deepgram): %r", transcript)
             return transcript, (time.perf_counter() - t0) * 1000
 
@@ -156,6 +185,7 @@ async def transcribe_audio(
                         ),
                     )
                 transcript = (result.text or "").strip()
+                transcript = normalize_wake_word(transcript)
                 logger.info("STT(whisper): %r", transcript)
                 return transcript, (time.perf_counter() - t0) * 1000
             finally:

@@ -259,30 +259,70 @@ function applyColorToObject(obj, hex) {
   });
 }
 
+let lastLoadedGlbUrl = null;
+
 async function setModelFromResponse(data) {
+  const newColor = data.color || currentColor;
+  const newGlbUrl = data.glb_url;
+  const needsNewModel = newGlbUrl && (data.rebuilt || newGlbUrl !== lastLoadedGlbUrl);
+
   if (data.color) {
     currentColor = data.color;
-    if (currentModel && !data.rebuilt) applyColorToObject(currentModel, currentColor);
   }
 
-  if (data.glb_url && data.rebuilt) {
-    const bust = `${data.glb_url}${data.glb_url.includes("?") ? "&" : "?"}t=${Date.now()}`;
-    const sceneObj = await loadGlb(bust);
-    const box = new THREE.Box3().setFromObject(sceneObj);
-    const size = box.getSize(new THREE.Vector3());
-    const maxDim = Math.max(size.x, size.y, size.z) || 1;
-    sceneObj.scale.setScalar(0.22 / maxDim);
-    box.setFromObject(sceneObj);
-    sceneObj.position.sub(box.getCenter(new THREE.Vector3()));
+  if (needsNewModel) {
+    const bust = `${newGlbUrl}${newGlbUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    console.log("[Percy] Loading new GLB:", bust);
 
-    prepareVisibleMaterials(sceneObj, currentColor);
+    try {
+      const sceneObj = await loadGlb(bust);
+      const box = new THREE.Box3().setFromObject(sceneObj);
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      sceneObj.scale.setScalar(0.22 / maxDim);
+      box.setFromObject(sceneObj);
+      sceneObj.position.sub(box.getCenter(new THREE.Vector3()));
 
-    if (currentModel) modelRoot.remove(currentModel);
-    placeholder.visible = false;
-    currentModel = sceneObj;
-    modelRoot.add(currentModel);
+      prepareVisibleMaterials(sceneObj, currentColor);
 
-    if (renderer.xr.isPresenting) placeModelInFrontOfUser();
+      const wasGrabbing = grabbing;
+      const savedOffset = grabbing ? grabOffset.clone() : null;
+      const savedPos = modelRoot.position.clone();
+      const savedQuat = modelRoot.quaternion.clone();
+
+      if (currentModel) {
+        modelRoot.remove(currentModel);
+        currentModel.traverse((child) => {
+          if (child.isMesh) {
+            child.geometry?.dispose();
+            if (child.material) {
+              const mats = Array.isArray(child.material) ? child.material : [child.material];
+              mats.forEach((m) => m.dispose());
+            }
+          }
+        });
+      }
+
+      placeholder.visible = false;
+      currentModel = sceneObj;
+      modelRoot.add(currentModel);
+      lastLoadedGlbUrl = newGlbUrl;
+
+      if (wasGrabbing && savedOffset) {
+        grabOffset.copy(savedOffset);
+        modelRoot.position.copy(savedPos);
+        modelRoot.quaternion.copy(savedQuat);
+      } else if (renderer.xr.isPresenting) {
+        placeModelInFrontOfUser();
+      }
+
+      console.log("[Percy] GLB loaded and applied successfully");
+    } catch (err) {
+      console.error("[Percy] Failed to load GLB:", err);
+    }
+  } else if (data.color && currentModel) {
+    applyColorToObject(currentModel, currentColor);
+    console.log("[Percy] Applied color update:", currentColor);
   }
 }
 
