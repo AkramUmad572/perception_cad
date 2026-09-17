@@ -13,8 +13,8 @@ from fastapi.staticfiles import StaticFiles
 
 from ai.intent import parse_intent
 from app.config import get_settings
-from app.models import CommandRequest, CommandResponse
-from app.pipeline import apply_intent
+from app.models import CommandRequest, CommandResponse, ScriptRequest
+from app.pipeline import apply_intent, execute_script_direct
 from app.session import get_session
 from voice.speech import transcribe_audio
 
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("perception_cad")
 
 settings = get_settings()
-app = FastAPI(title="Perception CAD", version="0.1.0")
+app = FastAPI(title="Perception CAD", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +45,7 @@ async def health():
     return {
         "ok": True,
         "cadquery": _cadquery_available(),
+        "sandbox": True,
         "stt": bool(
             settings.elevenlabs_api_key
             or settings.deepgram_api_key
@@ -89,6 +90,30 @@ async def command(body: CommandRequest):
         settings,
         transcript=body.text,
         extra_latency={"intent_ms": intent_ms},
+    )
+    result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
+    return result
+
+
+@app.post("/api/script", response_model=CommandResponse)
+async def execute_script(body: ScriptRequest):
+    """
+    Execute a CadQuery script directly in the sandbox.
+
+    This endpoint is for Taha's codegen integration - bypasses intent parsing
+    and executes the script directly with full safety (timeout, no FS/network,
+    non-manifold rejection).
+
+    The script must define a 'result', 'solid', or 'model' variable.
+    """
+    t_all = time.perf_counter()
+    session = get_session(body.session_id)
+
+    result = await execute_script_direct(
+        script=body.script,
+        session=session,
+        settings=settings,
+        color=body.color,
     )
     result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
     return result
@@ -143,7 +168,7 @@ async def voice(
         return CommandResponse(
             ok=False,
             transcript=None,
-            reply="Voice failed — try again, or use Demo / text on desktop.",
+            reply="Voice failed — try again.",
             action="clarify",
             session=session,
             latency_ms={"total_ms": (time.perf_counter() - t_all) * 1000},

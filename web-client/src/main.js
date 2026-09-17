@@ -1,3 +1,13 @@
+/**
+ * Perception CAD - WebXR Passthrough AR Client
+ *
+ * Voice-driven CAD on Quest 3 via passthrough AR.
+ * Percy wake word → VAD listen → STT/Gemini → CadQuery → GLB render
+ *
+ * Chrome stripped: No tutorial UI, no PTT buttons.
+ * VoiceState hooks exposed for in-world HUD (design owns visuals).
+ */
+
 import * as THREE from "three";
 import { ARButton } from "three/addons/webxr/ARButton.js";
 import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
@@ -5,44 +15,24 @@ import { XRHandModelFactory } from "three/addons/webxr/XRHandModelFactory.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
-// --- Debug flags (URL params) ---
+import { PercyAssistant } from "./voice/PercyAssistant.js";
+import { voiceState, VoiceStates } from "./voice/VoiceState.js";
+
 const params = new URLSearchParams(window.location.search);
 const DEBUG_HUD = params.has("debug") && (params.get("debug") === "hud" || params.get("debug") === "1" || params.get("debug") === "true" || params.get("debug") === "");
 
-// --- DOM elements (conditionally shown) ---
+const SESSION_ID = "default";
+const API_BASE = "";
+
 const statusEl = document.getElementById("status");
-const talkBtn = document.getElementById("talkBtn");
-const demoBtn = document.getElementById("demoBtn");
 const arButtonHost = document.getElementById("arButton");
 const overlayRoot = document.getElementById("overlay");
 const hudEl = document.getElementById("hud");
 const minimalStatusEl = document.getElementById("minimalStatus");
 
-// Enable debug HUD if flag set
 if (DEBUG_HUD) {
   hudEl?.classList.add("debug-visible");
   minimalStatusEl?.classList.add("debug-visible");
-}
-
-const SESSION_ID = "default";
-const API_BASE = "";
-
-// --- VoiceState: minimal in-world state machine for Percy affordances ---
-const VoiceState = {
-  IDLE: "idle",
-  LISTENING: "listening",
-  THINKING: "thinking",
-  SPEAKING: "speaking",
-  ERROR: "error",
-  MUTED: "muted",
-};
-
-let currentVoiceState = VoiceState.IDLE;
-let isMuted = false;
-
-function setVoiceState(state) {
-  currentVoiceState = state;
-  updateVoiceIndicator();
 }
 
 function setStatus(msg, ok = false) {
@@ -56,7 +46,6 @@ function setStatus(msg, ok = false) {
   }
 }
 
-// --- Passthrough AR scene (no virtual room) ---
 const container = document.getElementById("app");
 const renderer = new THREE.WebGLRenderer({
   antialias: true,
@@ -77,7 +66,6 @@ scene.background = null;
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
 camera.position.set(0, 1.5, 0.8);
 
-// Strong lighting so metals don't go black in passthrough
 scene.add(new THREE.AmbientLight(0xffffff, 0.85));
 scene.add(new THREE.HemisphereLight(0xffffff, 0xb0b0b0, 1.2));
 const key = new THREE.DirectionalLight(0xffffff, 1.4);
@@ -90,25 +78,22 @@ scene.add(fill);
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
-// Model root — repositioned in front of your headset when AR starts
 const modelRoot = new THREE.Group();
 modelRoot.position.set(0, 1.3, -0.7);
 scene.add(modelRoot);
 
 const placeholder = new THREE.Mesh(
-  new THREE.TorusGeometry(0.07, 0.022, 32, 64),
+  new THREE.SphereGeometry(0.03, 32, 16),
   new THREE.MeshStandardMaterial({
-    color: 0xffcc33,
-    roughness: 0.3,
-    metalness: 0.05,
-    emissive: 0xaa7700,
-    emissiveIntensity: 0.35,
+    color: 0x4f8cff,
+    roughness: 0.4,
+    metalness: 0.1,
+    emissive: 0x2244aa,
+    emissiveIntensity: 0.3,
   })
 );
-placeholder.rotation.x = Math.PI / 2;
 modelRoot.add(placeholder);
 
-// Soft highlight when hand is near / grabbing
 const halo = new THREE.Mesh(
   new THREE.RingGeometry(0.12, 0.14, 48),
   new THREE.MeshBasicMaterial({
@@ -122,24 +107,23 @@ const halo = new THREE.Mesh(
 halo.rotation.x = -Math.PI / 2;
 modelRoot.add(halo);
 
-// --- In-world VoiceState indicator (Percy affordance) ---
 const voiceIndicatorGroup = new THREE.Group();
 voiceIndicatorGroup.visible = false;
 scene.add(voiceIndicatorGroup);
 
 const VOICE_COLORS = {
-  [VoiceState.IDLE]: 0x4f8cff,
-  [VoiceState.LISTENING]: 0xe53935,
-  [VoiceState.THINKING]: 0xffc107,
-  [VoiceState.SPEAKING]: 0x4caf50,
-  [VoiceState.ERROR]: 0xff5722,
-  [VoiceState.MUTED]: 0x9e9e9e,
+  idle: 0x4f8cff,
+  listening: 0xe53935,
+  thinking: 0xffc107,
+  speaking: 0x4caf50,
+  error: 0xff5722,
+  muted: 0x9e9e9e,
 };
 
 const voiceRing = new THREE.Mesh(
   new THREE.TorusGeometry(0.018, 0.004, 16, 32),
   new THREE.MeshBasicMaterial({
-    color: VOICE_COLORS[VoiceState.IDLE],
+    color: VOICE_COLORS.idle,
     transparent: true,
     opacity: 0.85,
   })
@@ -150,7 +134,7 @@ voiceIndicatorGroup.add(voiceRing);
 const voiceDot = new THREE.Mesh(
   new THREE.SphereGeometry(0.006, 16, 16),
   new THREE.MeshBasicMaterial({
-    color: VOICE_COLORS[VoiceState.IDLE],
+    color: VOICE_COLORS.idle,
     transparent: true,
     opacity: 0.9,
   })
@@ -169,19 +153,18 @@ const muteIndicator = new THREE.Mesh(
 muteIndicator.position.set(0, 0, 0.02);
 voiceIndicatorGroup.add(muteIndicator);
 
-function updateVoiceIndicator() {
-  const state = isMuted ? VoiceState.MUTED : currentVoiceState;
-  const color = VOICE_COLORS[state] || VOICE_COLORS[VoiceState.IDLE];
+function updateVoiceIndicator(state) {
+  const color = VOICE_COLORS[state] || VOICE_COLORS.idle;
   voiceRing.material.color.setHex(color);
   voiceDot.material.color.setHex(color);
-  muteIndicator.material.opacity = isMuted ? 0.9 : 0.0;
+  muteIndicator.material.opacity = state === "muted" ? 0.9 : 0.0;
 
-  if (state === VoiceState.LISTENING) {
+  if (state === "listening") {
     voiceRing.scale.setScalar(1.2);
     voiceDot.scale.setScalar(1.3);
-  } else if (state === VoiceState.THINKING) {
+  } else if (state === "thinking") {
     voiceRing.scale.setScalar(1.0);
-  } else if (state === VoiceState.SPEAKING) {
+  } else if (state === "speaking") {
     voiceRing.scale.setScalar(1.1);
   } else {
     voiceRing.scale.setScalar(1.0);
@@ -190,8 +173,7 @@ function updateVoiceIndicator() {
 }
 
 let currentModel = null;
-let currentColor = "#FFD700";
-let replyAudio = null;
+let currentColor = "#C0C0C0";
 let needsUserPlacement = false;
 let placeFrameCount = 0;
 const loader = new GLTFLoader();
@@ -302,26 +284,8 @@ async function setModelFromResponse(data) {
 
     if (renderer.xr.isPresenting) placeModelInFrontOfUser();
   }
-
-  if (data.reply_audio_url) {
-    try {
-      if (replyAudio) {
-        try { replyAudio.pause(); } catch (_) {}
-      }
-      setVoiceState(VoiceState.SPEAKING);
-      replyAudio = new Audio(data.reply_audio_url);
-      replyAudio.onended = () => setVoiceState(VoiceState.IDLE);
-      replyAudio.onerror = () => setVoiceState(VoiceState.IDLE);
-      replyAudio.play().catch(() => setVoiceState(VoiceState.IDLE));
-    } catch (_) {
-      setVoiceState(VoiceState.IDLE);
-    }
-  } else {
-    setVoiceState(VoiceState.IDLE);
-  }
 }
 
-// --- Enter AR (passthrough) + DOM overlay for minimal controls ---
 const arBtn = ARButton.createButton(renderer, {
   optionalFeatures: ["local-floor", "hand-tracking", "dom-overlay"],
   domOverlay: { root: overlayRoot },
@@ -337,18 +301,17 @@ renderer.xr.addEventListener("sessionstart", () => {
   placeFrameCount = 0;
   if (!currentModel) placeholder.visible = true;
   setStatus("Entering passthrough AR…", true);
-  setVoiceState(VoiceState.IDLE);
 });
+
 renderer.xr.addEventListener("sessionend", () => {
   renderer.setClearColor(0x0a0c12, 1);
   needsUserPlacement = false;
-  setStatus("AR ended.");
+  setStatus("AR ended — tap Enter AR again.");
   voiceIndicatorGroup.visible = false;
 });
 
 renderer.setClearColor(0x0a0c12, 1);
 
-// --- Controllers + hands ---
 const controllerModelFactory = new XRControllerModelFactory();
 const handModelFactory = new XRHandModelFactory();
 
@@ -382,7 +345,6 @@ function setupHand(index) {
 const left = setupHand(0);
 const right = setupHand(1);
 
-// --- Interaction state (improved pinch) ---
 let grabSource = null;
 let grabHandKey = -1;
 const grabOffset = new THREE.Matrix4();
@@ -513,21 +475,7 @@ function pollHand(handEntry, key) {
   wasPinching[key] = isPinching;
 }
 
-// --- Controller squeeze for voice (push-to-talk via hardware) ---
 for (const entry of [left, right]) {
-  entry.controller.addEventListener("squeezestart", () => {
-    if (!isMuted) {
-      startTalk();
-      entry.controller.userData.squeezeTalk = true;
-    }
-  });
-  entry.controller.addEventListener("squeezeend", () => {
-    if (entry.controller.userData.squeezeTalk) {
-      entry.controller.userData.squeezeTalk = false;
-      stopTalk();
-    }
-  });
-
   entry.controller.addEventListener("selectstart", () => {
     entry.controller.getWorldPosition(_pinch);
     if (nearModel(_pinch, GRAB_RANGE)) beginGrab(entry.controller, -1);
@@ -537,215 +485,14 @@ for (const entry of [left, right]) {
   });
 }
 
-// --- API ---
-async function sendCommand(text) {
-  setVoiceState(VoiceState.THINKING);
-  setStatus(`Thinking: "${text}"…`);
-  try {
-    const res = await fetch(`${API_BASE}/api/command`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, session_id: SESSION_ID }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    await setModelFromResponse(data);
-    const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
-    setStatus(`${data.reply}${ms}`, data.ok);
-    return data;
-  } catch (err) {
-    setVoiceState(VoiceState.ERROR);
-    setStatus(`Error: ${err.message}`);
-    throw err;
-  }
-}
+const percy = new PercyAssistant({
+  onModelUpdate: (data) => setModelFromResponse(data),
+  onStatusMessage: (msg, ok) => setStatus(msg, ok),
+});
 
-async function sendVoice(blob, attempt = 1) {
-  setVoiceState(VoiceState.THINKING);
-  setStatus("Processing…");
-  const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
-  const form = new FormData();
-  form.append("audio", blob, `utterance.${ext}`);
-  form.append("session_id", SESSION_ID);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
-  try {
-    const res = await fetch(`${API_BASE}/api/voice`, {
-      method: "POST",
-      body: form,
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    await setModelFromResponse(data);
-    const heard = data.transcript ? `"${data.transcript}"` : "";
-    const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
-    setStatus(`${heard} ${data.reply}${ms}`, data.ok);
-    return data;
-  } catch (err) {
-    if (attempt < 2 && err.name !== "AbortError") {
-      setStatus("Retrying…");
-      return sendVoice(blob, attempt + 1);
-    }
-    setVoiceState(VoiceState.ERROR);
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// --- Voice recording ---
-let mediaStream = null;
-let mediaRecorder = null;
-let chunks = [];
-let recording = false;
-let voiceBusy = false;
-let pendingBlob = null;
-
-function pickMime() {
-  for (const t of ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"]) {
-    if (window.MediaRecorder?.isTypeSupported?.(t)) return t;
-  }
-  return "";
-}
-
-async function getMicStream() {
-  if (mediaStream?.active) return mediaStream;
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-  });
-  return mediaStream;
-}
-
-async function flushVoice(blob) {
-  voiceBusy = true;
-  if (talkBtn) talkBtn.disabled = true;
-  try {
-    await sendVoice(blob);
-  } catch (err) {
-    const msg = err.name === "AbortError" ? "timed out" : err.message;
-    setStatus(`Voice failed: ${msg}`);
-    setVoiceState(VoiceState.ERROR);
-  } finally {
-    voiceBusy = false;
-    if (talkBtn) talkBtn.disabled = false;
-    if (pendingBlob) {
-      const next = pendingBlob;
-      pendingBlob = null;
-      flushVoice(next);
-    }
-  }
-}
-
-async function startTalk() {
-  if (recording || isMuted) return;
-  try {
-    if (replyAudio) {
-      try { replyAudio.pause(); } catch (_) {}
-      replyAudio = null;
-    }
-    const stream = await getMicStream();
-    const mime = pickMime();
-    chunks = [];
-    mediaRecorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-    const usedMime = mediaRecorder.mimeType || mime || "audio/webm";
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data?.size > 0) chunks.push(e.data);
-    };
-    mediaRecorder.onstop = async () => {
-      recording = false;
-      if (talkBtn) {
-        talkBtn.classList.remove("recording");
-        talkBtn.textContent = "Hold to talk";
-      }
-      const blob = new Blob(chunks, { type: usedMime });
-      chunks = [];
-      if (blob.size < 400) {
-        setStatus("Hold longer, then release.");
-        setVoiceState(VoiceState.IDLE);
-        return;
-      }
-      if (voiceBusy) {
-        pendingBlob = blob;
-        setStatus("Queued…");
-        return;
-      }
-      await flushVoice(blob);
-    };
-
-    mediaRecorder.start(100);
-    recording = true;
-    setVoiceState(VoiceState.LISTENING);
-    if (talkBtn) {
-      talkBtn.classList.add("recording");
-      talkBtn.textContent = "Listening…";
-    }
-    setStatus("Listening…");
-  } catch (err) {
-    recording = false;
-    setStatus(`Mic error: ${err.message}`);
-    setVoiceState(VoiceState.ERROR);
-  }
-}
-
-function stopTalk() {
-  if (!recording || !mediaRecorder) return;
-  if (mediaRecorder.state === "recording" || mediaRecorder.state === "paused") {
-    try { mediaRecorder.requestData(); } catch (_) {}
-    try { mediaRecorder.stop(); } catch (_) {}
-  } else {
-    recording = false;
-    if (talkBtn) {
-      talkBtn.classList.remove("recording");
-      talkBtn.textContent = "Hold to talk";
-    }
-    setVoiceState(VoiceState.IDLE);
-  }
-}
-
-// --- Mute toggle (public API for external integration) ---
-function toggleMute() {
-  isMuted = !isMuted;
-  updateVoiceIndicator();
-  if (isMuted && recording) stopTalk();
-  return isMuted;
-}
-
-// Export VoiceState API for external hooks (Tabish/Taha wake-word integration)
-window.PerceptionCAD = {
-  VoiceState,
-  getVoiceState: () => currentVoiceState,
-  setVoiceState,
-  isMuted: () => isMuted,
-  toggleMute,
-  startTalk,
-  stopTalk,
-  sendCommand,
-};
-
-// --- HTML buttons (debug HUD only) ---
-if (talkBtn) {
-  talkBtn.addEventListener("pointerdown", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    talkBtn.setPointerCapture?.(e.pointerId);
-    startTalk();
-  });
-  talkBtn.addEventListener("pointerup", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    stopTalk();
-  });
-  talkBtn.addEventListener("pointercancel", () => stopTalk());
-  talkBtn.addEventListener("lostpointercapture", () => stopTalk());
-}
-
-if (demoBtn) {
-  demoBtn.addEventListener("click", () => {
-    sendCommand("build me a ring").catch((err) => setStatus(err.message));
-  });
-}
+voiceState.subscribe((snapshot) => {
+  updateVoiceIndicator(snapshot.state);
+});
 
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -753,7 +500,6 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- Animation pulse for voice indicator ---
 let pulsePhase = 0;
 
 renderer.setAnimationLoop(() => {
@@ -762,7 +508,7 @@ renderer.setAnimationLoop(() => {
     if (placeFrameCount >= 3) {
       placeModelInFrontOfUser(0.7);
       needsUserPlacement = false;
-      setStatus(currentModel ? "Pinch model to grab/spin. Squeeze to talk." : "Squeeze to talk.", true);
+      setStatus("Say 'Percy' to give a command. Pinch model to grab.", true);
     }
   }
 
@@ -770,14 +516,15 @@ renderer.setAnimationLoop(() => {
 
   if (voiceIndicatorGroup.visible) {
     pulsePhase += 0.08;
-    if (currentVoiceState === VoiceState.LISTENING) {
+    const state = voiceState.state;
+    if (state === "listening") {
       const pulse = 1.0 + 0.15 * Math.sin(pulsePhase * 2);
       voiceRing.scale.setScalar(pulse);
       voiceDot.scale.setScalar(pulse);
-    } else if (currentVoiceState === VoiceState.THINKING) {
+    } else if (state === "thinking") {
       const spin = pulsePhase * 0.5;
       voiceRing.rotation.z = spin;
-    } else if (currentVoiceState === VoiceState.SPEAKING) {
+    } else if (state === "speaking") {
       const pulse = 1.0 + 0.1 * Math.sin(pulsePhase * 3);
       voiceDot.scale.setScalar(pulse);
     }
@@ -796,7 +543,6 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 
-// Desktop preview: drag to move, drag+shift to spin
 let desktopMode = null;
 const pointer = new THREE.Vector2();
 const raycaster = new THREE.Raycaster();
@@ -813,7 +559,9 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     lastPtr.set(e.clientX, e.clientY);
   }
 });
-window.addEventListener("pointerup", () => { desktopMode = null; });
+window.addEventListener("pointerup", () => {
+  desktopMode = null;
+});
 window.addEventListener("pointermove", (e) => {
   if (!desktopMode || renderer.xr.isPresenting) return;
   const dx = e.clientX - lastPtr.x;
@@ -828,9 +576,23 @@ window.addEventListener("pointermove", (e) => {
   }
 });
 
+window.addEventListener("keydown", (e) => {
+  if (e.key === "m" || e.key === "M") {
+    percy.toggleMute();
+  }
+});
+
 fetch(`${API_BASE}/api/health`)
   .then((r) => r.json())
   .then((h) => {
-    setStatus(`Ready · CadQuery ${h.cadquery ? "on" : "off"} · voice ${h.stt && h.tts ? "on" : "partial"}`, true);
+    const status = `CadQuery ${h.cadquery ? "✓" : "✗"} · Voice ${h.stt && h.tts ? "✓" : "partial"}`;
+    setStatus(`Percy ready. Say 'Percy' to activate. ${status}`, true);
+    percy.start();
   })
-  .catch(() => setStatus("API offline — start backend on :8000"));
+  .catch(() => {
+    setStatus("API offline — start backend on :8000");
+  });
+
+window.percyAssistant = percy;
+window.voiceState = voiceState;
+window.VoiceStates = VoiceStates;
