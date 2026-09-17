@@ -9,7 +9,8 @@ from typing import Any
 from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState
 from app.session import save_session
-from cad import execute_cadquery, DEFAULTS
+from cad import DEFAULTS
+from cad.sandbox import execute_cadquery_script
 from cad.builder import merge_params, build_model
 from voice.speech import synthesize_speech
 
@@ -32,6 +33,9 @@ async def _execute_with_retry(
     """
     Execute CadQuery script in sandbox with retry loop on failure.
     
+    Uses Tabish's canonical entrypoint: execute_cadquery_script()
+    Returns dict: {ok, glb_path, model_id, exec_ms} or {ok=False, error, error_type}
+    
     Returns (success, model_id_or_none, error_or_none).
     """
     from ai.intent import repair_and_retry
@@ -41,18 +45,16 @@ async def _execute_with_retry(
     last_error = None
 
     for attempt in range(MAX_RETRIES + 1):
-        t0 = time.perf_counter()
-        result = execute_cadquery(
+        result = execute_cadquery_script(
             script=current_script,
             output_dir=settings.glb_dir,
             timeout=30.0,
             color=color,
         )
-        exec_ms = (time.perf_counter() - t0) * 1000
-        latency[f"cad_ms_attempt_{attempt}"] = exec_ms
+        latency[f"cad_ms_attempt_{attempt}"] = result.get("exec_ms", 0)
 
         if result["ok"]:
-            latency["cad_ms"] = result.get("exec_ms", exec_ms)
+            latency["cad_ms"] = result.get("exec_ms", 0)
             session.template = None
             session.params = {}
             session.model_id = result["model_id"]
