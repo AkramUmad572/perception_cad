@@ -3,10 +3,10 @@ CAD module for Perception CAD.
 
 Primary API for FREE-REIN codegen integration:
 
-    from cad import execute_cadquery
+    from cad.sandbox import execute_cadquery_script
 
     # Gemini/LLM generates ANY CadQuery script from user utterance
-    result = execute_cadquery(
+    result = execute_cadquery_script(
         script='import cadquery as cq\\nresult = cq.Workplane("XY").sphere(15)',
         output_dir="/path/to/glb",
         timeout=30,
@@ -19,16 +19,25 @@ Primary API for FREE-REIN codegen integration:
         # On failure, feed error back to LLM for repair (see ai.intent.repair_and_retry)
         print(f"Failed ({result['error_type']}): {result['error']}")
 
-Flow: wake → listen → Gemini codegen → execute_cadquery → retry on failure → GLB
+Also available as:
+    from cad.sandbox import execute_script  # alias
+    from cad.sandbox import execute_cadquery  # alias
+
+Flow: wake → listen → Gemini codegen → execute_cadquery_script → retry on failure → GLB
 """
 
 from cad.sandbox import (
-    execute_cadquery,
+    # Primary API
     execute_cadquery_script,
+    # Aliases
+    execute_script,
+    execute_cadquery,
+    # Exceptions
     SandboxError,
     TimeoutError,
     NonManifoldError,
     SecurityError,
+    # Constants
     EXEC_TIMEOUT_SEC,
 )
 
@@ -42,9 +51,10 @@ from cad.builder import (
 
 __all__ = [
     # Primary API for codegen
-    "execute_cadquery",
-    # Lower-level APIs
     "execute_cadquery_script",
+    "execute_script",
+    "execute_cadquery",
+    # Legacy template builder
     "build_model",
     "build_from_script",
     "build_any",

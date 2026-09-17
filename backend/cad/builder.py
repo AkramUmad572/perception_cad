@@ -260,14 +260,19 @@ def build_from_script(
     Raises:
         SandboxError, TimeoutError, NonManifoldError, SecurityError
     """
-    from cad.sandbox import execute_cadquery_script
+    from cad.sandbox import execute_cadquery_script, SandboxError
 
-    return execute_cadquery_script(
+    result = execute_cadquery_script(
         script=script,
         output_dir=settings.glb_dir,
         timeout=timeout,
         color=color,
     )
+
+    if not result["ok"]:
+        raise SandboxError(result["error"])
+
+    return result["model_id"], Path(result["glb_path"]), result["exec_ms"]
 
 
 def build_any(

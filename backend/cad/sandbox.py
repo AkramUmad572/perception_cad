@@ -1,6 +1,9 @@
 """
 Sandboxed CadQuery script execution.
 
+Public API:
+    execute_cadquery_script(script: str) -> { ok, glb_path | error }
+
 Provides safe execution of generated CadQuery scripts with:
 - Hard timeout (kills hung exec)
 - No filesystem access (blocked builtins)
@@ -13,8 +16,6 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
-import signal
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -213,29 +214,15 @@ def _run_in_sandbox(script: str, out_glb: str, result_queue: multiprocessing.Que
         result_queue.put({"ok": False, "error": str(e), "error_type": type(e).__name__})
 
 
-def execute_cadquery_script(
+def _execute_sandboxed(
     script: str,
     output_dir: Path,
     timeout: float = EXEC_TIMEOUT_SEC,
     color: str = "#C0C0C0",
 ) -> tuple[str, Path, float]:
     """
-    Execute a CadQuery script in a sandbox and return GLB.
-
-    Args:
-        script: CadQuery Python script to execute
-        output_dir: Directory to write GLB output
-        timeout: Maximum execution time in seconds
-        color: Hex color to apply to mesh
-
-    Returns:
-        Tuple of (model_id, glb_path, exec_time_ms)
-
-    Raises:
-        SandboxError: If execution fails
-        TimeoutError: If execution times out
-        NonManifoldError: If mesh is non-manifold
-        SecurityError: If script attempts blocked operations
+    Internal: Execute script and return tuple (model_id, glb_path, exec_ms).
+    Raises exceptions on failure.
     """
     model_id = uuid.uuid4().hex[:12]
     out_glb = output_dir / f"{model_id}.glb"
@@ -296,25 +283,25 @@ def execute_cadquery_script(
     return model_id, out_glb, exec_ms
 
 
-def execute_cadquery(
+def execute_cadquery_script(
     script: str,
-    output_dir: Path | str,
+    output_dir: Path | str | None = None,
     timeout: float = EXEC_TIMEOUT_SEC,
     color: str = "#C0C0C0",
 ) -> dict:
     """
-    Execute CadQuery script in sandbox. Clean API for codegen integration.
+    Execute CadQuery script in sandbox.
 
-    This is the primary API for Taha's Gemini codegen to call.
+    PRIMARY PUBLIC API for Gemini codegen integration.
 
     Args:
         script: CadQuery Python script. Must define 'result', 'solid', or 'model'.
-        output_dir: Directory to write GLB output (Path or str).
+        output_dir: Directory for GLB output. Defaults to /tmp/perception_cad_glb.
         timeout: Max execution time in seconds (default 30).
-        color: Hex color to apply (default silver).
+        color: Hex color to apply (default silver #C0C0C0).
 
     Returns:
-        dict with keys:
+        dict:
             ok: bool - True if successful
             glb_path: str - Absolute path to GLB file (only if ok=True)
             model_id: str - Unique model identifier (only if ok=True)
@@ -323,17 +310,16 @@ def execute_cadquery(
             error_type: str - One of: 'timeout', 'security', 'non_manifold', 'syntax', 'execution'
 
     Example:
-        >>> from cad.sandbox import execute_cadquery
-        >>> result = execute_cadquery(
+        >>> from cad.sandbox import execute_cadquery_script
+        >>> result = execute_cadquery_script(
         ...     script='import cadquery as cq\\nresult = cq.Workplane("XY").box(10, 10, 5)',
-        ...     output_dir="/tmp/glb",
         ... )
         >>> if result["ok"]:
         ...     print(f"GLB at: {result['glb_path']}")
         ... else:
-        ...     print(f"Failed: {result['error']}")
+        ...     print(f"Failed ({result['error_type']}): {result['error']}")
 
-    Safety guarantees:
+    Safety:
         - 30s hard timeout (kills hung processes)
         - No filesystem access (open, pathlib, shutil blocked)
         - No network access (socket, urllib, requests blocked)
@@ -342,7 +328,9 @@ def execute_cadquery(
         - Memory limit: 2GB
         - Vertex/face limits: 500k each
     """
-    if isinstance(output_dir, str):
+    if output_dir is None:
+        output_dir = Path("/tmp/perception_cad_glb")
+    elif isinstance(output_dir, str):
         output_dir = Path(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -350,7 +338,7 @@ def execute_cadquery(
     t0 = time.perf_counter()
 
     try:
-        model_id, glb_path, exec_ms = execute_cadquery_script(
+        model_id, glb_path, exec_ms = _execute_sandboxed(
             script=script,
             output_dir=output_dir,
             timeout=timeout,
@@ -404,3 +392,8 @@ def execute_cadquery(
             "error_type": "execution",
             "exec_ms": (time.perf_counter() - t0) * 1000,
         }
+
+
+# Aliases for convenience
+execute_script = execute_cadquery_script
+execute_cadquery = execute_cadquery_script
