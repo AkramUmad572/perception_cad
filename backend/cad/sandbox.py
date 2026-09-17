@@ -294,3 +294,113 @@ def execute_cadquery_script(
 
     logger.info("Sandbox exec completed in %.1fms → %s", exec_ms, out_glb.name)
     return model_id, out_glb, exec_ms
+
+
+def execute_cadquery(
+    script: str,
+    output_dir: Path | str,
+    timeout: float = EXEC_TIMEOUT_SEC,
+    color: str = "#C0C0C0",
+) -> dict:
+    """
+    Execute CadQuery script in sandbox. Clean API for codegen integration.
+
+    This is the primary API for Taha's Gemini codegen to call.
+
+    Args:
+        script: CadQuery Python script. Must define 'result', 'solid', or 'model'.
+        output_dir: Directory to write GLB output (Path or str).
+        timeout: Max execution time in seconds (default 30).
+        color: Hex color to apply (default silver).
+
+    Returns:
+        dict with keys:
+            ok: bool - True if successful
+            glb_path: str - Absolute path to GLB file (only if ok=True)
+            model_id: str - Unique model identifier (only if ok=True)
+            exec_ms: float - Execution time in milliseconds
+            error: str - Error message (only if ok=False)
+            error_type: str - One of: 'timeout', 'security', 'non_manifold', 'syntax', 'execution'
+
+    Example:
+        >>> from cad.sandbox import execute_cadquery
+        >>> result = execute_cadquery(
+        ...     script='import cadquery as cq\\nresult = cq.Workplane("XY").box(10, 10, 5)',
+        ...     output_dir="/tmp/glb",
+        ... )
+        >>> if result["ok"]:
+        ...     print(f"GLB at: {result['glb_path']}")
+        ... else:
+        ...     print(f"Failed: {result['error']}")
+
+    Safety guarantees:
+        - 30s hard timeout (kills hung processes)
+        - No filesystem access (open, pathlib, shutil blocked)
+        - No network access (socket, urllib, requests blocked)
+        - No code injection (exec, eval, compile, __import__ blocked)
+        - Non-manifold mesh rejection (with repair attempt)
+        - Memory limit: 2GB
+        - Vertex/face limits: 500k each
+    """
+    if isinstance(output_dir, str):
+        output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.perf_counter()
+
+    try:
+        model_id, glb_path, exec_ms = execute_cadquery_script(
+            script=script,
+            output_dir=output_dir,
+            timeout=timeout,
+            color=color,
+        )
+        return {
+            "ok": True,
+            "glb_path": str(glb_path),
+            "model_id": model_id,
+            "exec_ms": exec_ms,
+        }
+
+    except TimeoutError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_type": "timeout",
+            "exec_ms": (time.perf_counter() - t0) * 1000,
+        }
+
+    except SecurityError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_type": "security",
+            "exec_ms": (time.perf_counter() - t0) * 1000,
+        }
+
+    except NonManifoldError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_type": "non_manifold",
+            "exec_ms": (time.perf_counter() - t0) * 1000,
+        }
+
+    except SandboxError as e:
+        error_msg = str(e)
+        error_type = "syntax" if "Syntax error" in error_msg else "execution"
+        return {
+            "ok": False,
+            "error": error_msg,
+            "error_type": error_type,
+            "exec_ms": (time.perf_counter() - t0) * 1000,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_type": "execution",
+            "exec_ms": (time.perf_counter() - t0) * 1000,
+        }
