@@ -13,20 +13,26 @@ from app.config import Settings
 logger = logging.getLogger(__name__)
 
 CAD_KEYTERMS = [
-    "ring",
-    "box",
-    "cube",
-    "cylinder",
-    "tube",
+    # Generic CAD/modeling verbs
     "build",
     "make",
-    "yellow",
+    "create",
+    "design",
+    # Dimension/size words
     "thicker",
     "thinner",
     "bigger",
     "smaller",
+    "taller",
+    "shorter",
+    "wider",
     "diameter",
     "millimeters",
+    # Colors
+    "yellow",
+    "blue",
+    "red",
+    "green",
 ]
 
 

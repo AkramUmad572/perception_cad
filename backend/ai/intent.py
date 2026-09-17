@@ -206,10 +206,7 @@ COLOR_MAP = {
 }
 
 _STT_FIXES = [
-    (r"\bbrings?\b", "ring"), (r"\brinks?\b", "ring"), (r"\bwrings?\b", "ring"),
-    (r"\brang\b", "ring"), (r"\bwrong\b", "ring"),
-    (r"\bcubes?\b", "box"), (r"\bblocks?\b", "box"),
-    (r"\btubes?\b", "cylinder"), (r"\bpipes?\b", "cylinder"),
+    # General STT corrections (not shape-biased)
     (r"\bbill me\b", "build me"), (r"\bbuilt me\b", "build me"),
     (r"\byello\b", "yellow"), (r"\bmellow\b", "yellow"),
 ]
