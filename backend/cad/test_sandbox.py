@@ -100,6 +100,9 @@ SECURITY_BLOCKED_SCRIPTS = {
     "from_os_import": "from os import getcwd\nresult = getcwd()",
     "import_sys": "import sys\nresult = sys.path",
     "import_pathlib": "from pathlib import Path\nresult = Path('/')",
+    # CadQuery proxy blocks access to internal modules
+    "cq_exporters": "import cadquery as cq\nx = cq.exporters\nresult = cq.Workplane('XY').box(10,10,5)",
+    "cq_occ_impl": "import cadquery as cq\nx = cq.occ_impl\nresult = cq.Workplane('XY').box(10,10,5)",
 }
 
 

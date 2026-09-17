@@ -183,6 +183,10 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     if base_module not in ALLOWED_IMPORT_MODULES:
         raise SecurityError(f"Import of '{name}' is not allowed in sandbox (allowlist: {', '.join(sorted(ALLOWED_IMPORT_MODULES))})")
 
+    # Return the safe proxy for cadquery imports instead of the real module
+    if base_module in ("cadquery", "cq"):
+        return _SafeCadQueryProxy()
+
     import importlib
     return importlib.import_module(name)
 
