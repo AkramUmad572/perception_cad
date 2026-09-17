@@ -300,6 +300,8 @@ async function setModelFromResponse(data) {
       prepareVisibleMaterials(sceneObj, currentColor);
 
       const wasGrabbing = grabbing;
+      const savedSource = grabSource;
+      const savedKey = grabHandKey;
       const savedOffset = grabbing ? grabOffset.clone() : null;
       const savedPos = modelRoot.position.clone();
       const savedQuat = modelRoot.quaternion.clone();
@@ -317,15 +319,19 @@ async function setModelFromResponse(data) {
         });
       }
 
+      clearStaleGrabRefs();
+
       placeholder.visible = false;
       currentModel = sceneObj;
       modelRoot.add(currentModel);
       lastLoadedGlbUrl = newGlbUrl;
 
-      if (wasGrabbing && savedOffset) {
+      if (wasGrabbing && savedOffset && savedSource) {
         grabOffset.copy(savedOffset);
         modelRoot.position.copy(savedPos);
         modelRoot.quaternion.copy(savedQuat);
+        beginGrab(savedSource, savedKey);
+        console.log("[Percy] Grab state rebound after mesh swap");
       } else if (renderer.xr.isPresenting) {
         placeModelInFrontOfUser();
       }
@@ -333,6 +339,7 @@ async function setModelFromResponse(data) {
       console.log("[Percy] GLB loaded and applied successfully");
     } catch (err) {
       console.error("[Percy] Failed to load GLB:", err);
+      clearStaleGrabRefs();
     }
   } else if (data.color && currentModel) {
     applyColorToObject(currentModel, currentColor);
