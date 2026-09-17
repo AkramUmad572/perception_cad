@@ -274,19 +274,27 @@ function applyColorToObject(obj, hex) {
 }
 
 let lastLoadedGlbUrl = null;
+let lastModelId = null;
 
 async function setModelFromResponse(data) {
   const newColor = data.color || currentColor;
   const newGlbUrl = data.glb_url;
-  const needsNewModel = newGlbUrl && (data.rebuilt || newGlbUrl !== lastLoadedGlbUrl);
+  const newModelId = data.model_id;
+  
+  // Contract: if rebuilt && model_id && glb_url → load new GLB + swap mesh
+  // Color path now always returns fresh model_id/glb_url with rebuilt:true
+  const needsNewModel = data.rebuilt && newModelId && newGlbUrl;
+  
+  // Fallback: also load if glb_url changed (defensive)
+  const glbUrlChanged = newGlbUrl && newGlbUrl !== lastLoadedGlbUrl;
 
   if (data.color) {
     currentColor = data.color;
   }
 
-  if (needsNewModel) {
+  if (needsNewModel || glbUrlChanged) {
     const bust = `${newGlbUrl}${newGlbUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
-    console.log("[Percy] Loading new GLB:", bust);
+    console.log("[Percy] Loading new GLB:", bust, "model_id:", newModelId);
 
     try {
       const sceneObj = await loadGlb(bust);
@@ -325,6 +333,7 @@ async function setModelFromResponse(data) {
       currentModel = sceneObj;
       modelRoot.add(currentModel);
       lastLoadedGlbUrl = newGlbUrl;
+      lastModelId = newModelId;
 
       if (wasGrabbing && savedOffset && savedSource) {
         grabOffset.copy(savedOffset);
@@ -336,12 +345,13 @@ async function setModelFromResponse(data) {
         placeModelInFrontOfUser();
       }
 
-      console.log("[Percy] GLB loaded and applied successfully");
+      console.log("[Percy] GLB loaded and applied successfully, model_id:", newModelId);
     } catch (err) {
       console.error("[Percy] Failed to load GLB:", err);
       clearStaleGrabRefs();
     }
   } else if (data.color && currentModel) {
+    // Color-only update (no new model) - apply directly to existing mesh
     applyColorToObject(currentModel, currentColor);
     console.log("[Percy] Applied color update:", currentColor);
   }

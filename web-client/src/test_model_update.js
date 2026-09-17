@@ -3,11 +3,15 @@
  *
  * Run with: node web-client/src/test_model_update.js
  *
+ * Response contract (per Taha 1715dba, 631905a):
+ *   ok, rebuilt, model_id, glb_url, color, reply
+ *   Color path always returns fresh model_id/glb_url with rebuilt:true
+ *
  * Tests that:
- * 1. setModelFromResponse detects new GLB URLs correctly
- * 2. Color-only updates apply without GLB reload
- * 3. New GLB URL triggers model replacement even if rebuilt=false
- * 4. lastLoadedGlbUrl tracking works correctly
+ * 1. rebuilt && model_id && glb_url → load GLB + swap mesh
+ * 2. Color-only updates apply without GLB reload (fallback)
+ * 3. glb_url change detection as defensive fallback
+ * 4. lastLoadedGlbUrl and lastModelId tracking
  */
 
 const assert = (condition, message) => {
@@ -32,43 +36,65 @@ function test(name, fn) {
 
 console.log("=".repeat(60));
 console.log("CLIENT MODEL UPDATE LOGIC TESTS");
+console.log("(Response contract: rebuilt && model_id && glb_url → swap)");
 console.log("=".repeat(60));
 
-console.log("\n=== Testing GLB URL Change Detection ===");
+console.log("\n=== Testing Response Contract (rebuilt && model_id && glb_url) ===");
 
-// Simulate the decision logic from setModelFromResponse
-function shouldLoadNewModel(data, lastLoadedGlbUrl) {
-  const newGlbUrl = data.glb_url;
-  return newGlbUrl && (data.rebuilt || newGlbUrl !== lastLoadedGlbUrl);
+// Primary contract: rebuilt && model_id && glb_url → load new model
+function shouldLoadNewModelContract(data) {
+  return !!(data.rebuilt && data.model_id && data.glb_url);
 }
 
-test("New GLB URL with rebuilt=true triggers load", () => {
+// Fallback: glb_url changed (defensive)
+function glbUrlChanged(data, lastLoadedGlbUrl) {
+  return !!(data.glb_url && data.glb_url !== lastLoadedGlbUrl);
+}
+
+// Combined logic matching setModelFromResponse
+function shouldLoadNewModel(data, lastLoadedGlbUrl) {
+  const needsNewModel = data.rebuilt && data.model_id && data.glb_url;
+  const urlChanged = data.glb_url && data.glb_url !== lastLoadedGlbUrl;
+  return !!(needsNewModel || urlChanged);
+}
+
+test("Contract: rebuilt && model_id && glb_url triggers load", () => {
+  const data = { glb_url: "/media/glb/new.glb", model_id: "model_123", rebuilt: true, color: "#FFD700" };
+  assert(shouldLoadNewModelContract(data) === true, "Contract should trigger load");
+  assert(shouldLoadNewModel(data, "/media/glb/old.glb") === true, "Combined should trigger load");
+});
+
+test("Contract: missing model_id does NOT trigger via contract", () => {
   const data = { glb_url: "/media/glb/new.glb", rebuilt: true, color: "#FFD700" };
+  assert(shouldLoadNewModelContract(data) === false, "Contract requires model_id");
+});
+
+test("Contract: rebuilt=false does NOT trigger via contract", () => {
+  const data = { glb_url: "/media/glb/new.glb", model_id: "model_123", rebuilt: false, color: "#FFD700" };
+  assert(shouldLoadNewModelContract(data) === false, "Contract requires rebuilt=true");
+});
+
+test("Fallback: Different GLB URL triggers load even without rebuilt", () => {
+  const data = { glb_url: "/media/glb/new.glb", rebuilt: false, color: "#FFD700" };
   const lastLoaded = "/media/glb/old.glb";
-  assert(shouldLoadNewModel(data, lastLoaded) === true, "Should trigger load");
+  assert(glbUrlChanged(data, lastLoaded) === true, "URL changed should be detected");
+  assert(shouldLoadNewModel(data, lastLoaded) === true, "Fallback should trigger load");
 });
 
 test("Same GLB URL with rebuilt=false does NOT trigger load", () => {
-  const data = { glb_url: "/media/glb/same.glb", rebuilt: false, color: "#FFD700" };
+  const data = { glb_url: "/media/glb/same.glb", model_id: "model_123", rebuilt: false, color: "#FFD700" };
   const lastLoaded = "/media/glb/same.glb";
   assert(shouldLoadNewModel(data, lastLoaded) === false, "Should not trigger load");
-});
-
-test("Different GLB URL with rebuilt=false DOES trigger load", () => {
-  const data = { glb_url: "/media/glb/new.glb", rebuilt: false, color: "#FFD700" };
-  const lastLoaded = "/media/glb/old.glb";
-  assert(shouldLoadNewModel(data, lastLoaded) === true, "Should trigger load for new URL");
 });
 
 test("No GLB URL does not trigger load", () => {
   const data = { color: "#FFD700", rebuilt: false };
   const lastLoaded = "/media/glb/old.glb";
-  // data.glb_url is undefined, so newGlbUrl is falsy, shouldLoadNewModel returns falsy
   assert(!shouldLoadNewModel(data, lastLoaded), "Should not trigger load without URL");
 });
 
-test("First GLB URL (lastLoaded=null) triggers load", () => {
-  const data = { glb_url: "/media/glb/first.glb", rebuilt: true, color: "#C0C0C0" };
+test("First GLB URL triggers load", () => {
+  const data = { glb_url: "/media/glb/first.glb", model_id: "model_001", rebuilt: true, color: "#C0C0C0" };
   const lastLoaded = null;
   assert(shouldLoadNewModel(data, lastLoaded) === true, "Should trigger first load");
 });
@@ -141,20 +167,27 @@ test("Parse response with glb_url but rebuilt=false (URL change detection)", () 
   assert(parsed.isRebuilt === false, "isRebuilt false");
 });
 
-console.log("\n=== Testing lastLoadedGlbUrl Tracking ===");
+console.log("\n=== Testing Model Tracker (lastLoadedGlbUrl + lastModelId) ===");
 
 class ModelTracker {
   constructor() {
     this.lastLoadedGlbUrl = null;
+    this.lastModelId = null;
   }
 
   processResponse(data) {
     const newGlbUrl = data.glb_url;
-    const needsNewModel = newGlbUrl && (data.rebuilt || newGlbUrl !== this.lastLoadedGlbUrl);
+    const newModelId = data.model_id;
+    
+    // Contract: rebuilt && model_id && glb_url → load
+    const needsNewModel = data.rebuilt && newModelId && newGlbUrl;
+    // Fallback: glb_url changed
+    const urlChanged = newGlbUrl && newGlbUrl !== this.lastLoadedGlbUrl;
 
-    if (needsNewModel) {
+    if (needsNewModel || urlChanged) {
       this.lastLoadedGlbUrl = newGlbUrl;
-      return { action: "load_new_model", url: newGlbUrl };
+      this.lastModelId = newModelId;
+      return { action: "load_new_model", url: newGlbUrl, model_id: newModelId };
     } else if (data.color) {
       return { action: "apply_color_only", color: data.color };
     }
@@ -162,34 +195,46 @@ class ModelTracker {
   }
 }
 
-test("Tracker loads first model", () => {
+test("Tracker loads first model with contract", () => {
   const tracker = new ModelTracker();
-  const result = tracker.processResponse({ glb_url: "/a.glb", rebuilt: true });
+  const result = tracker.processResponse({ glb_url: "/a.glb", model_id: "m1", rebuilt: true });
   assert(result.action === "load_new_model", "Action");
   assert(tracker.lastLoadedGlbUrl === "/a.glb", "Tracked URL");
+  assert(tracker.lastModelId === "m1", "Tracked model_id");
 });
 
 test("Tracker detects same URL as color-only", () => {
   const tracker = new ModelTracker();
-  tracker.processResponse({ glb_url: "/a.glb", rebuilt: true });
-  const result = tracker.processResponse({ glb_url: "/a.glb", color: "#FF0000", rebuilt: false });
+  tracker.processResponse({ glb_url: "/a.glb", model_id: "m1", rebuilt: true });
+  const result = tracker.processResponse({ glb_url: "/a.glb", model_id: "m1", color: "#FF0000", rebuilt: false });
   assert(result.action === "apply_color_only", "Action should be color only");
 });
 
-test("Tracker detects URL change even without rebuilt flag", () => {
+test("Tracker loads new model via contract (color change with new model)", () => {
   const tracker = new ModelTracker();
-  tracker.processResponse({ glb_url: "/a.glb", rebuilt: true });
+  tracker.processResponse({ glb_url: "/a.glb", model_id: "m1", rebuilt: true });
+  // Color path now returns fresh model_id/glb_url with rebuilt:true
+  const result = tracker.processResponse({ glb_url: "/b.glb", model_id: "m2", color: "#FF0000", rebuilt: true });
+  assert(result.action === "load_new_model", "Should load new model for color change");
+  assert(tracker.lastModelId === "m2", "Model ID updated");
+});
+
+test("Tracker detects URL change as fallback", () => {
+  const tracker = new ModelTracker();
+  tracker.processResponse({ glb_url: "/a.glb", model_id: "m1", rebuilt: true });
   const result = tracker.processResponse({ glb_url: "/b.glb", color: "#FF0000", rebuilt: false });
-  assert(result.action === "load_new_model", "Action should be load new model");
+  assert(result.action === "load_new_model", "Fallback should load on URL change");
   assert(tracker.lastLoadedGlbUrl === "/b.glb", "Tracked URL updated");
 });
 
 test("Tracker handles color-only response (no glb_url)", () => {
   const tracker = new ModelTracker();
   tracker.lastLoadedGlbUrl = "/a.glb";
+  tracker.lastModelId = "m1";
   const result = tracker.processResponse({ color: "#00FF00" });
   assert(result.action === "apply_color_only", "Color only");
   assert(tracker.lastLoadedGlbUrl === "/a.glb", "URL unchanged");
+  assert(tracker.lastModelId === "m1", "Model ID unchanged");
 });
 
 // Summary
