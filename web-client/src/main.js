@@ -596,3 +596,20 @@ fetch(`${API_BASE}/api/health`)
 window.percyAssistant = percy;
 window.voiceState = voiceState;
 window.VoiceStates = VoiceStates;
+
+window.PerceptionCAD = {
+  VoiceState: VoiceStates,
+  getVoiceState: () => voiceState.state,
+  setVoiceState: (state) => {
+    if (state === VoiceStates.IDLE) voiceState.toIdle();
+    else if (state === VoiceStates.LISTENING) voiceState.toListening();
+    else if (state === VoiceStates.THINKING) voiceState.toThinking();
+    else if (state === VoiceStates.SPEAKING) voiceState.toSpeaking();
+    else if (state === VoiceStates.ERROR) voiceState.toError();
+  },
+  isMuted: () => voiceState.isMuted,
+  toggleMute: () => percy.toggleMute(),
+  startListening: () => percy._onWakeWord(),
+  stopListening: () => {},
+  sendCommand: (text) => percy.sendTextCommand(text),
+};
