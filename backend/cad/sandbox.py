@@ -35,6 +35,20 @@ BLOCKED_BUILTINS = frozenset([
     "__import__",
     "input",
     "breakpoint",
+    "getattr",
+    "setattr",
+    "delattr",
+    "type",
+    "object",
+    "vars",
+    "dir",
+    "globals",
+    "locals",
+    "memoryview",
+    "classmethod",
+    "staticmethod",
+    "property",
+    "super",
 ])
 
 BLOCKED_MODULES = frozenset([
@@ -55,6 +69,35 @@ BLOCKED_MODULES = frozenset([
     "ctypes",
     "multiprocessing",
     "threading",
+])
+
+ALLOWED_MODULES = frozenset([
+    "math",
+    "decimal",
+    "fractions",
+    "cmath",
+    "itertools",
+    "functools",
+    "operator",
+    "collections",
+])
+
+ALLOWED_CADQUERY_ATTRS = frozenset([
+    "Workplane",
+    "Assembly",
+    "Sketch",
+    "Vector",
+    "Location",
+    "Plane",
+    "Solid",
+    "Shell",
+    "Face",
+    "Wire",
+    "Edge",
+    "Vertex",
+    "Shape",
+    "Compound",
+    "Color",
 ])
 
 
@@ -78,6 +121,34 @@ class SecurityError(SandboxError):
     pass
 
 
+class _SafeCadQueryProxy:
+    """
+    Thin proxy exposing only allowlisted CadQuery classes.
+    
+    Blocks access to full cadquery module internals that may carry
+    filesystem/network parent references via __module__, __file__, etc.
+    """
+    __slots__ = ("_allowed",)
+
+    def __init__(self):
+        import cadquery as _real_cq
+        self._allowed = {}
+        for attr in ALLOWED_CADQUERY_ATTRS:
+            if hasattr(_real_cq, attr):
+                self._allowed[attr] = getattr(_real_cq, attr)
+
+    def __getattr__(self, name: str):
+        if name in self._allowed:
+            return self._allowed[name]
+        raise SecurityError(
+            f"Access to 'cq.{name}' is not allowed in sandbox "
+            f"(allowed: {', '.join(sorted(ALLOWED_CADQUERY_ATTRS))})"
+        )
+
+    def __dir__(self):
+        return list(ALLOWED_CADQUERY_ATTRS)
+
+
 def _create_safe_builtins():
     """Create restricted builtins dict."""
     import builtins
@@ -90,18 +161,17 @@ def _create_safe_builtins():
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """Restricted import that blocks dangerous modules."""
+    """Restricted import that ONLY allows explicitly allowlisted modules."""
     base_module = name.split(".")[0]
-    if base_module in BLOCKED_MODULES:
-        raise SecurityError(f"Import of '{name}' is blocked in sandbox")
 
-    if fromlist:
-        for item in fromlist:
-            if item in BLOCKED_MODULES:
-                raise SecurityError(f"Import of '{item}' from '{name}' is blocked")
+    if base_module not in ALLOWED_MODULES:
+        raise SecurityError(f"Import of '{name}' is not allowed in sandbox (allowlist: {', '.join(sorted(ALLOWED_MODULES))})")
 
     import importlib
     return importlib.import_module(name)
+
+
+ALLOWED_IMPORT_MODULES = ALLOWED_MODULES | frozenset(["cadquery", "cq"])
 
 
 def _validate_script(script: str) -> None:
@@ -117,13 +187,19 @@ def _validate_script(script: str) -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 base = alias.name.split(".")[0]
-                if base in BLOCKED_MODULES:
-                    raise SecurityError(f"Import of '{alias.name}' is blocked")
+                if base not in ALLOWED_IMPORT_MODULES:
+                    raise SecurityError(
+                        f"Import of '{alias.name}' is not allowed "
+                        f"(allowed: {', '.join(sorted(ALLOWED_IMPORT_MODULES))})"
+                    )
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 base = node.module.split(".")[0]
-                if base in BLOCKED_MODULES:
-                    raise SecurityError(f"Import from '{node.module}' is blocked")
+                if base not in ALLOWED_IMPORT_MODULES:
+                    raise SecurityError(
+                        f"Import from '{node.module}' is not allowed "
+                        f"(allowed: {', '.join(sorted(ALLOWED_IMPORT_MODULES))})"
+                    )
 
 
 def _check_manifold(mesh) -> bool:
@@ -158,9 +234,9 @@ def _run_in_sandbox(script: str, out_glb: str, result_queue: multiprocessing.Que
         safe_globals = _create_safe_builtins()
         safe_globals["__import__"] = _safe_import
 
-        import cadquery as cq
-        safe_globals["cq"] = cq
-        safe_globals["cadquery"] = cq
+        safe_cq = _SafeCadQueryProxy()
+        safe_globals["cq"] = safe_cq
+        safe_globals["cadquery"] = safe_cq
 
         import math
         safe_globals["math"] = math
