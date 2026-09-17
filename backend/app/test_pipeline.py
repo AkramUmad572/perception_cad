@@ -407,6 +407,460 @@ async def test_generate_action_no_script_returns_clarify():
 
 
 # ============================================================================
+# COMPLEX FREE-REIN SCRIPTS FIXTURE
+# These are sandbox-safe CadQuery scripts for complex shapes.
+# Used in tests to verify the pipeline returns rebuilt=True + model_id + glb_url.
+#
+# Each script uses ONLY allowed operations:
+# - cq.Workplane("XY"/"XZ"/"YZ")
+# - .box(), .cylinder(), .sphere(), .circle(), .rect(), .polygon()
+# - .extrude(), .loft(), .revolve()
+# - .hole(), .cut(), .union(), .fillet(), .chamfer()
+# - .text(), .faces(), .edges(), .workplane(), .center()
+# - import math for trig/constants
+# ============================================================================
+
+COMPLEX_SCRIPTS = {
+    "keychain_with_hole_and_text": '''import cadquery as cq
+plate = cq.Workplane("XY").box(50, 25, 4).edges("|Z").fillet(3)
+with_hole = plate.faces(">Z").workplane().center(20, 0).hole(5)
+result = with_hole.faces(">Z").workplane().center(-5, 0).text("KEY", 8, 1)
+''',
+
+    "phone_stand": '''import cadquery as cq
+base = cq.Workplane("XY").box(80, 50, 8)
+back = cq.Workplane("XY").workplane(offset=8).center(0, -20).box(80, 10, 60)
+lip = cq.Workplane("XY").workplane(offset=8).center(0, 10).box(80, 5, 15)
+result = base.union(back).union(lip).edges().fillet(2)
+''',
+
+    "mug_with_handle": '''import cadquery as cq
+body = cq.Workplane("XY").circle(25).extrude(60).faces(">Z").shell(-3)
+handle = cq.Workplane("XZ").center(25, 30).ellipse(8, 15).extrude(5)
+result = body.union(handle)
+''',
+
+    "gear_12_teeth": '''import cadquery as cq
+import math
+n_teeth = 12
+outer_r, inner_r = 25, 20
+pts = []
+for i in range(n_teeth * 2):
+    angle = i * math.pi / n_teeth
+    r = outer_r if i % 2 == 0 else inner_r
+    pts.append((r * math.cos(angle), r * math.sin(angle)))
+result = cq.Workplane("XY").polyline(pts).close().extrude(8).faces(">Z").workplane().hole(10)
+''',
+
+    "nameplate": '''import cadquery as cq
+plate = cq.Workplane("XY").box(100, 30, 5).edges("|Z").fillet(5)
+result = plate.faces(">Z").workplane().text("HELLO", 12, 2)
+''',
+
+    "desk_organizer": '''import cadquery as cq
+base = cq.Workplane("XY").box(120, 80, 10)
+pen_holder = cq.Workplane("XY").workplane(offset=10).center(-40, 0).box(30, 30, 60)
+pen_with_hole = pen_holder.faces(">Z").workplane().hole(20)
+card_slot = cq.Workplane("XY").workplane(offset=10).center(20, 0).box(60, 10, 40)
+result = base.union(pen_with_hole).union(card_slot)
+''',
+
+    "vase": '''import cadquery as cq
+pts = [(0, 0), (20, 0), (15, 30), (18, 50), (10, 60), (10, 65), (18, 65), (20, 50), (17, 30), (22, 0)]
+result = cq.Workplane("XZ").polyline(pts).close().revolve(360, (0, 0, 0), (0, 1, 0))
+''',
+
+    "hinge": '''import cadquery as cq
+plate1 = cq.Workplane("XY").box(40, 30, 3)
+plate2 = cq.Workplane("XY").workplane(offset=3).center(0, 15).box(40, 30, 3)
+pin_cyl = cq.Workplane("XZ").center(0, 4.5).circle(3).extrude(40)
+result = plate1.union(plate2).union(pin_cyl).faces(">Z").workplane().center(0, 15).hole(2)
+''',
+}
+
+
+# ============================================================================
+# Test 7: Complex free-rein scripts return rebuilt=True + model_id + glb_url
+# ============================================================================
+
+async def test_complex_freerein_scripts_return_rebuilt():
+    """
+    Test that complex free-rein CadQuery scripts return rebuilt=True + model_id + glb_url.
+    
+    These test cases cover:
+    - keychain with hole and text (box + fillet + hole + text)
+    - phone stand (multiple boxes + union + fillet)
+    - mug with handle (cylinder + shell + ellipse + union)
+    - 12-tooth gear (polyline + math + extrude + hole)
+    - nameplate (box + fillet + text)
+    - desk organizer (boxes + union + hole)
+    - vase (polyline + revolve)
+    - hinge (boxes + cylinder + union + hole)
+    
+    All use sandbox-safe CadQuery operations:
+    Workplane, box, hole, fillet, cut, text, extrude, union, shell, polyline, revolve
+    """
+    print("\n" + "=" * 60)
+    print("=== Test: Complex free-rein scripts return rebuilt ===")
+    print("=" * 60)
+    
+    settings = _mock_settings()
+    total_pass = 0
+    total_fail = 0
+    
+    for name, script in COMPLEX_SCRIPTS.items():
+        print(f"\n  Testing: {name}")
+        
+        session = SessionState(
+            session_id="test",
+            model_id="old_model",
+            glb_url="/media/glb/old_model.glb",
+            color="#C0C0C0",
+        )
+        
+        intent = Intent(
+            action="generate",
+            script=script,
+            reply=f"Built {name}.",
+        )
+        
+        # Mock sandbox to return success with unique model_id
+        new_model_id = f"complex_{name}_model"
+        
+        with patch("app.pipeline._execute_with_retry") as mock_exec:
+            mock_exec.return_value = (True, new_model_id, None)
+            
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+        
+        errors = []
+        
+        if not result.rebuilt:
+            errors.append("rebuilt should be True")
+        
+        if result.model_id != new_model_id:
+            errors.append(f"model_id should be '{new_model_id}', got {result.model_id!r}")
+        
+        if result.glb_url is None:
+            errors.append("glb_url should not be None")
+        
+        if not result.ok:
+            errors.append(f"ok should be True, got error: {result.error}")
+        
+        # Verify mock was called with the script
+        mock_exec.assert_called_once()
+        call_args = mock_exec.call_args
+        called_script = call_args[1].get("script") or call_args[0][0]
+        if called_script != script:
+            errors.append("_execute_with_retry not called with correct script")
+        
+        if errors:
+            print(f"    ✗ FAILED:")
+            for e in errors:
+                print(f"      - {e}")
+            total_fail += 1
+        else:
+            print(f"    ✓ {name}: rebuilt=True, model_id={new_model_id}")
+            total_pass += 1
+    
+    return total_pass, total_fail
+
+
+# ============================================================================
+# Test 8: Verify scripts use sandbox-safe CadQuery patterns
+# ============================================================================
+
+def test_complex_scripts_are_sandbox_safe():
+    """
+    Verify that COMPLEX_SCRIPTS only use sandbox-allowed patterns.
+    
+    ALLOWED:
+    - import cadquery as cq
+    - import math
+    - cq.Workplane("XY"/"XZ"/"YZ")
+    - .box(), .circle(), .rect(), .polygon(), .polyline()
+    - .extrude(), .loft(), .revolve()
+    - .hole(), .cut(), .union(), .intersect()
+    - .fillet(), .chamfer()
+    - .text(), .shell()
+    - .faces(), .edges(), .workplane(), .center()
+    - Python loops/variables for geometry
+    
+    FORBIDDEN:
+    - import os/sys/subprocess/socket/etc
+    - open(), exec(), eval(), getattr()
+    - cq.occ_impl, cq.exporters, cq.__file__
+    """
+    print("\n=== Test: Complex scripts use sandbox-safe patterns ===")
+    
+    import ast
+    
+    ALLOWED_IMPORTS = {"cadquery", "cq", "math"}
+    FORBIDDEN_CALLS = {"open", "exec", "eval", "compile", "getattr", "setattr", "delattr"}
+    
+    total_pass = 0
+    total_fail = 0
+    
+    for name, script in COMPLEX_SCRIPTS.items():
+        errors = []
+        
+        try:
+            tree = ast.parse(script)
+        except SyntaxError as e:
+            errors.append(f"Syntax error: {e}")
+            print(f"  ✗ {name}: {errors}")
+            total_fail += 1
+            continue
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    base = alias.name.split(".")[0]
+                    if base not in ALLOWED_IMPORTS:
+                        errors.append(f"Forbidden import: {alias.name}")
+            
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    base = node.module.split(".")[0]
+                    if base not in ALLOWED_IMPORTS:
+                        errors.append(f"Forbidden import from: {node.module}")
+            
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in FORBIDDEN_CALLS:
+                        errors.append(f"Forbidden call: {node.func.id}()")
+        
+        if errors:
+            print(f"  ✗ {name}:")
+            for e in errors:
+                print(f"    - {e}")
+            total_fail += 1
+        else:
+            print(f"  ✓ {name}: sandbox-safe")
+            total_pass += 1
+    
+    return total_pass, total_fail
+
+
+# ============================================================================
+# Test 9: Follow-up on complex session.last_script
+# ============================================================================
+
+async def test_followups_on_complex_script():
+    """
+    Test follow-up operations on a complex session.last_script.
+    
+    Scenario: User built a complex gear, then:
+    1. set_material yellow → rebuilt=True + new model_id
+    2. generate "make it bigger" (scaled script) → rebuilt=True + new model_id
+    3. generate "add a hole" (modified script) → rebuilt=True + new model_id
+    
+    All MUST return rebuilt=True with fresh model_id/glb_url.
+    """
+    print("\n=== Test: Follow-ups on complex session.last_script ===")
+    
+    settings = _mock_settings()
+    total_pass = 0
+    total_fail = 0
+    
+    # Original complex script (gear)
+    original_script = COMPLEX_SCRIPTS["gear_12_teeth"]
+    
+    # Test 1: set_material yellow
+    print("\n  9a. set_material yellow on gear")
+    session = SessionState(
+        session_id="test",
+        last_script=original_script,
+        model_id="gear_original",
+        glb_url="/media/glb/gear_original.glb",
+        color="#C0C0C0",
+    )
+    
+    intent = Intent(
+        action="set_material",
+        params={"color": "#FFD700"},
+        reply="Made it yellow.",
+    )
+    
+    with patch("app.pipeline._execute_with_retry") as mock_exec:
+        mock_exec.return_value = (True, "gear_yellow", None)
+        with patch("app.pipeline.synthesize_speech") as mock_tts:
+            mock_tts.return_value = (None, 0.0)
+            with patch("app.pipeline.save_session"):
+                result = await apply_intent(intent, session, settings)
+    
+    if result.rebuilt and result.model_id == "gear_yellow" and result.ok:
+        print(f"    ✓ set_material: rebuilt=True, model_id=gear_yellow")
+        total_pass += 1
+    else:
+        print(f"    ✗ set_material: rebuilt={result.rebuilt}, model_id={result.model_id}, ok={result.ok}")
+        total_fail += 1
+    
+    # Test 2: generate "make it bigger" (scaled script)
+    print("\n  9b. generate 'make it bigger' (scaled script)")
+    
+    # Simulated scaled script (1.25x dimensions)
+    scaled_script = '''import cadquery as cq
+import math
+n_teeth = 12
+outer_r, inner_r = 31.25, 25.0  # scaled 1.25x
+pts = []
+for i in range(n_teeth * 2):
+    angle = i * math.pi / n_teeth
+    r = outer_r if i % 2 == 0 else inner_r
+    pts.append((r * math.cos(angle), r * math.sin(angle)))
+result = cq.Workplane("XY").polyline(pts).close().extrude(10).faces(">Z").workplane().hole(12.5)
+'''
+    
+    session.last_script = original_script  # Reset
+    intent = Intent(
+        action="generate",
+        script=scaled_script,
+        reply="Made it bigger.",
+    )
+    
+    with patch("app.pipeline._execute_with_retry") as mock_exec:
+        mock_exec.return_value = (True, "gear_bigger", None)
+        with patch("app.pipeline.synthesize_speech") as mock_tts:
+            mock_tts.return_value = (None, 0.0)
+            with patch("app.pipeline.save_session"):
+                result = await apply_intent(intent, session, settings)
+    
+    if result.rebuilt and result.model_id == "gear_bigger" and result.ok:
+        print(f"    ✓ scale 'bigger': rebuilt=True, model_id=gear_bigger")
+        total_pass += 1
+    else:
+        print(f"    ✗ scale 'bigger': rebuilt={result.rebuilt}, model_id={result.model_id}, ok={result.ok}")
+        total_fail += 1
+    
+    # Test 3: generate "add a hole" (modified script)
+    print("\n  9c. generate 'add a hole' (modified script)")
+    
+    # Script with additional hole
+    hole_script = '''import cadquery as cq
+import math
+n_teeth = 12
+outer_r, inner_r = 25, 20
+pts = []
+for i in range(n_teeth * 2):
+    angle = i * math.pi / n_teeth
+    r = outer_r if i % 2 == 0 else inner_r
+    pts.append((r * math.cos(angle), r * math.sin(angle)))
+gear = cq.Workplane("XY").polyline(pts).close().extrude(8).faces(">Z").workplane().hole(10)
+result = gear.faces(">Z").workplane().center(15, 0).hole(5)  # additional hole
+'''
+    
+    intent = Intent(
+        action="generate",
+        script=hole_script,
+        reply="Added a hole.",
+    )
+    
+    with patch("app.pipeline._execute_with_retry") as mock_exec:
+        mock_exec.return_value = (True, "gear_with_hole", None)
+        with patch("app.pipeline.synthesize_speech") as mock_tts:
+            mock_tts.return_value = (None, 0.0)
+            with patch("app.pipeline.save_session"):
+                result = await apply_intent(intent, session, settings)
+    
+    if result.rebuilt and result.model_id == "gear_with_hole" and result.ok:
+        print(f"    ✓ add hole: rebuilt=True, model_id=gear_with_hole")
+        total_pass += 1
+    else:
+        print(f"    ✗ add hole: rebuilt={result.rebuilt}, model_id={result.model_id}, ok={result.ok}")
+        total_fail += 1
+    
+    return total_pass, total_fail
+
+
+# ============================================================================
+# Test 10: FAIL if complex shapes collapse to ring/box/cylinder templates
+# ============================================================================
+
+async def test_no_collapse_to_templates():
+    """
+    Assert that complex free-rein shapes do NOT collapse to ring/box/cylinder templates.
+    
+    The pipeline should use action="generate" with script execution,
+    NOT action="create" with template="ring"/"box"/"cylinder".
+    
+    If apply_intent were to use the template path for complex shapes,
+    it would be a regression (loss of fidelity).
+    """
+    print("\n=== Test: Complex shapes do NOT collapse to templates ===")
+    
+    from cad.builder import DEFAULTS
+    TEMPLATE_NAMES = set(DEFAULTS.keys())  # {"ring", "box", "cylinder"}
+    
+    settings = _mock_settings()
+    total_pass = 0
+    total_fail = 0
+    
+    for name, script in COMPLEX_SCRIPTS.items():
+        print(f"\n  Testing: {name}")
+        
+        session = SessionState(
+            session_id="test",
+            template=None,  # No template
+            model_id="old_model",
+            color="#C0C0C0",
+        )
+        
+        intent = Intent(
+            action="generate",  # MUST be generate, not create
+            script=script,
+            template=None,  # MUST be None, not ring/box/cylinder
+            reply=f"Built {name}.",
+        )
+        
+        errors = []
+        
+        # Check: action must be "generate", not "create"
+        if intent.action == "create":
+            errors.append("action should be 'generate', not 'create'")
+        
+        # Check: template must be None, not a basic template
+        if intent.template in TEMPLATE_NAMES:
+            errors.append(f"template should be None, not '{intent.template}'")
+        
+        # Check: script must be present
+        if not intent.script:
+            errors.append("script should be present for free-rein shapes")
+        
+        # Verify the pipeline would execute via generate path
+        with patch("app.pipeline._execute_with_retry") as mock_exec:
+            mock_exec.return_value = (True, f"freerein_{name}", None)
+            
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+        
+        # Check result action is still "generate", not collapsed to "create"
+        if result.action == "create":
+            errors.append(f"result.action should be 'generate', got 'create'")
+        
+        # Check template was not set on session
+        if session.template in TEMPLATE_NAMES:
+            errors.append(f"session.template should be None, got '{session.template}'")
+        
+        if errors:
+            print(f"    ✗ COLLAPSED TO TEMPLATE:")
+            for e in errors:
+                print(f"      - {e}")
+            total_fail += 1
+        else:
+            print(f"    ✓ {name}: uses generate path, no template collapse")
+            total_pass += 1
+    
+    return total_pass, total_fail
+
+
+# ============================================================================
 # Run All Tests
 # ============================================================================
 
@@ -414,7 +868,7 @@ def run_all_tests():
     """Run all pipeline regression tests."""
     print("=" * 60)
     print("PIPELINE REGRESSION TESTS")
-    print("(Color + Size/Geometry follow-up response contract)")
+    print("(Color + Size/Geometry + Complex Free-rein)")
     print("=" * 60)
     
     total_pass = 0
@@ -425,7 +879,10 @@ def run_all_tests():
     asyncio.set_event_loop(loop)
     
     try:
-        # Color change tests (existing)
+        # === BASIC TESTS ===
+        print("\n--- Basic Follow-up Tests ---")
+        
+        # Color change tests
         p, f = loop.run_until_complete(test_color_change_with_script_returns_new_model())
         total_pass += p
         total_fail += f
@@ -438,7 +895,7 @@ def run_all_tests():
         total_pass += p
         total_fail += f
         
-        # Generate action tests (new - size/geometry edits)
+        # Generate action tests
         p, f = loop.run_until_complete(test_generate_action_with_script_returns_new_model())
         total_pass += p
         total_fail += f
@@ -450,6 +907,30 @@ def run_all_tests():
         p, f = loop.run_until_complete(test_generate_action_no_script_returns_clarify())
         total_pass += p
         total_fail += f
+        
+        # === COMPLEX FREE-REIN TESTS ===
+        print("\n--- Complex Free-rein Tests ---")
+        
+        # Sync test: verify scripts are sandbox-safe
+        p, f = test_complex_scripts_are_sandbox_safe()
+        total_pass += p
+        total_fail += f
+        
+        # Async test: complex scripts return rebuilt
+        p, f = loop.run_until_complete(test_complex_freerein_scripts_return_rebuilt())
+        total_pass += p
+        total_fail += f
+        
+        # Async test: follow-ups on complex script
+        p, f = loop.run_until_complete(test_followups_on_complex_script())
+        total_pass += p
+        total_fail += f
+        
+        # Async test: no collapse to templates
+        p, f = loop.run_until_complete(test_no_collapse_to_templates())
+        total_pass += p
+        total_fail += f
+        
     finally:
         loop.close()
     
