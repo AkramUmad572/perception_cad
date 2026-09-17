@@ -118,6 +118,8 @@ const VOICE_COLORS = {
   speaking: 0x4caf50,
   error: 0xff5722,
   muted: 0x9e9e9e,
+  wake_tentative: 0xffab00, // Amber for tentative wake detection
+  wake_miss: 0xff6d00,      // Orange flash for missed wake / retry
 };
 
 const voiceRing = new THREE.Mesh(
@@ -153,6 +155,9 @@ const muteIndicator = new THREE.Mesh(
 muteIndicator.position.set(0, 0, 0.02);
 voiceIndicatorGroup.add(muteIndicator);
 
+let wakeTentativeFlashPhase = 0;
+let wakeMissFlashActive = false;
+
 function updateVoiceIndicator(state) {
   const color = VOICE_COLORS[state] || VOICE_COLORS.idle;
   voiceRing.material.color.setHex(color);
@@ -166,9 +171,18 @@ function updateVoiceIndicator(state) {
     voiceRing.scale.setScalar(1.0);
   } else if (state === "speaking") {
     voiceRing.scale.setScalar(1.1);
+  } else if (state === "wake_tentative") {
+    wakeTentativeFlashPhase = 0;
+    voiceRing.scale.setScalar(1.15);
+    voiceDot.scale.setScalar(1.2);
+  } else if (state === "wake_miss") {
+    wakeMissFlashActive = true;
+    voiceRing.scale.setScalar(1.3);
+    voiceDot.scale.setScalar(1.4);
   } else {
     voiceRing.scale.setScalar(1.0);
     voiceDot.scale.setScalar(1.0);
+    wakeMissFlashActive = false;
   }
 }
 
@@ -465,6 +479,12 @@ function endGrab() {
   halo.material.color.setHex(0x4f8cff);
 }
 
+function clearStaleGrabRefs() {
+  if (grabbing && !modelInteractTarget()) {
+    endGrab();
+  }
+}
+
 function updateGrab() {
   if (!grabbing || !grabSource) return;
   grabSource.updateMatrixWorld(true);
@@ -567,6 +587,23 @@ renderer.setAnimationLoop(() => {
     } else if (state === "speaking") {
       const pulse = 1.0 + 0.1 * Math.sin(pulsePhase * 3);
       voiceDot.scale.setScalar(pulse);
+    } else if (state === "wake_tentative") {
+      wakeTentativeFlashPhase += 0.15;
+      const pulse = 1.1 + 0.2 * Math.sin(wakeTentativeFlashPhase * 4);
+      const opacity = 0.6 + 0.35 * Math.sin(wakeTentativeFlashPhase * 4);
+      voiceRing.scale.setScalar(pulse);
+      voiceDot.scale.setScalar(pulse);
+      voiceRing.material.opacity = opacity;
+      voiceDot.material.opacity = opacity;
+    } else if (state === "wake_miss") {
+      const flashPulse = 1.2 + 0.25 * Math.sin(pulsePhase * 6);
+      voiceRing.scale.setScalar(flashPulse);
+      voiceDot.scale.setScalar(flashPulse);
+      voiceRing.material.opacity = 0.9;
+      voiceDot.material.opacity = 0.95;
+    } else {
+      voiceRing.material.opacity = 0.85;
+      voiceDot.material.opacity = 0.9;
     }
   }
 
@@ -646,10 +683,24 @@ window.PerceptionCAD = {
     else if (state === VoiceStates.THINKING) voiceState.toThinking();
     else if (state === VoiceStates.SPEAKING) voiceState.toSpeaking();
     else if (state === VoiceStates.ERROR) voiceState.toError();
+    else if (state === VoiceStates.WAKE_TENTATIVE) voiceState.toWakeTentative();
+    else if (state === VoiceStates.WAKE_MISS) voiceState.toWakeMiss();
   },
   isMuted: () => voiceState.isMuted,
   toggleMute: () => percy.toggleMute(),
   startListening: () => percy._onWakeWord(),
   stopListening: () => {},
   sendCommand: (text) => percy.sendTextCommand(text),
+  onVoiceStateChange: (callback) => voiceState.subscribe(callback),
+  
+  isGrabbing: () => grabbing,
+  clearStaleGrabRefs: clearStaleGrabRefs,
+  rebindGrabAfterMeshSwap: () => {
+    if (grabbing && grabSource) {
+      const wasSource = grabSource;
+      const wasKey = grabHandKey;
+      endGrab();
+      beginGrab(wasSource, wasKey);
+    }
+  },
 };
