@@ -5,21 +5,55 @@ import { XRHandModelFactory } from "three/addons/webxr/XRHandModelFactory.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
+// --- Debug flags (URL params) ---
+const params = new URLSearchParams(window.location.search);
+const DEBUG_HUD = params.has("debug") && (params.get("debug") === "hud" || params.get("debug") === "1" || params.get("debug") === "true" || params.get("debug") === "");
+
+// --- DOM elements (conditionally shown) ---
 const statusEl = document.getElementById("status");
 const talkBtn = document.getElementById("talkBtn");
 const demoBtn = document.getElementById("demoBtn");
 const arButtonHost = document.getElementById("arButton");
 const overlayRoot = document.getElementById("overlay");
+const hudEl = document.getElementById("hud");
+const minimalStatusEl = document.getElementById("minimalStatus");
+
+// Enable debug HUD if flag set
+if (DEBUG_HUD) {
+  hudEl?.classList.add("debug-visible");
+  minimalStatusEl?.classList.add("debug-visible");
+}
 
 const SESSION_ID = "default";
 const API_BASE = "";
 
+// --- VoiceState: minimal in-world state machine for Percy affordances ---
+const VoiceState = {
+  IDLE: "idle",
+  LISTENING: "listening",
+  THINKING: "thinking",
+  SPEAKING: "speaking",
+  ERROR: "error",
+  MUTED: "muted",
+};
+
+let currentVoiceState = VoiceState.IDLE;
+let isMuted = false;
+
+function setVoiceState(state) {
+  currentVoiceState = state;
+  updateVoiceIndicator();
+}
+
 function setStatus(msg, ok = false) {
-  statusEl.textContent = msg;
-  statusEl.classList.toggle("ok", !!ok);
-  try {
-    setXrStatus?.(msg);
-  } catch (_) {}
+  if (statusEl) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle("ok", !!ok);
+  }
+  if (minimalStatusEl) {
+    minimalStatusEl.textContent = msg;
+    minimalStatusEl.classList.toggle("ok", !!ok);
+  }
 }
 
 // --- Passthrough AR scene (no virtual room) ---
@@ -38,7 +72,7 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = null; // real world shows through
+scene.background = null;
 
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
 camera.position.set(0, 1.5, 0.8);
@@ -88,6 +122,73 @@ const halo = new THREE.Mesh(
 halo.rotation.x = -Math.PI / 2;
 modelRoot.add(halo);
 
+// --- In-world VoiceState indicator (Percy affordance) ---
+const voiceIndicatorGroup = new THREE.Group();
+voiceIndicatorGroup.visible = false;
+scene.add(voiceIndicatorGroup);
+
+const VOICE_COLORS = {
+  [VoiceState.IDLE]: 0x4f8cff,
+  [VoiceState.LISTENING]: 0xe53935,
+  [VoiceState.THINKING]: 0xffc107,
+  [VoiceState.SPEAKING]: 0x4caf50,
+  [VoiceState.ERROR]: 0xff5722,
+  [VoiceState.MUTED]: 0x9e9e9e,
+};
+
+const voiceRing = new THREE.Mesh(
+  new THREE.TorusGeometry(0.018, 0.004, 16, 32),
+  new THREE.MeshBasicMaterial({
+    color: VOICE_COLORS[VoiceState.IDLE],
+    transparent: true,
+    opacity: 0.85,
+  })
+);
+voiceRing.rotation.x = Math.PI / 2;
+voiceIndicatorGroup.add(voiceRing);
+
+const voiceDot = new THREE.Mesh(
+  new THREE.SphereGeometry(0.006, 16, 16),
+  new THREE.MeshBasicMaterial({
+    color: VOICE_COLORS[VoiceState.IDLE],
+    transparent: true,
+    opacity: 0.9,
+  })
+);
+voiceIndicatorGroup.add(voiceDot);
+
+const muteIndicator = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.012, 0.003),
+  new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    transparent: true,
+    opacity: 0.0,
+    side: THREE.DoubleSide,
+  })
+);
+muteIndicator.position.set(0, 0, 0.02);
+voiceIndicatorGroup.add(muteIndicator);
+
+function updateVoiceIndicator() {
+  const state = isMuted ? VoiceState.MUTED : currentVoiceState;
+  const color = VOICE_COLORS[state] || VOICE_COLORS[VoiceState.IDLE];
+  voiceRing.material.color.setHex(color);
+  voiceDot.material.color.setHex(color);
+  muteIndicator.material.opacity = isMuted ? 0.9 : 0.0;
+
+  if (state === VoiceState.LISTENING) {
+    voiceRing.scale.setScalar(1.2);
+    voiceDot.scale.setScalar(1.3);
+  } else if (state === VoiceState.THINKING) {
+    voiceRing.scale.setScalar(1.0);
+  } else if (state === VoiceState.SPEAKING) {
+    voiceRing.scale.setScalar(1.1);
+  } else {
+    voiceRing.scale.setScalar(1.0);
+    voiceDot.scale.setScalar(1.0);
+  }
+}
+
 let currentModel = null;
 let currentColor = "#FFD700";
 let replyAudio = null;
@@ -98,9 +199,8 @@ const loader = new GLTFLoader();
 const _camPos = new THREE.Vector3();
 const _camQuat = new THREE.Quaternion();
 const _forward = new THREE.Vector3();
-let grabbing = false; // declared early for placeModelInFrontOfUser halo timeout
+let grabbing = false;
 
-/** Put the model ~arm's length in front of the headset (fixes empty passthrough view). */
 function placeModelInFrontOfUser(distance = 0.7) {
   const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
   cam.updateMatrixWorld(true);
@@ -109,14 +209,10 @@ function placeModelInFrontOfUser(distance = 0.7) {
 
   _forward.set(0, 0, -1).applyQuaternion(_camQuat).normalize();
   modelRoot.position.copy(_camPos).addScaledVector(_forward, distance);
-  // Keep near chest / lower eye height so it's easy to look at
   modelRoot.position.y = _camPos.y - 0.2;
 
-  // Face the user
   modelRoot.quaternion.identity();
-  const face = new THREE.Vector3()
-    .copy(_camPos)
-    .setY(modelRoot.position.y);
+  const face = new THREE.Vector3().copy(_camPos).setY(modelRoot.position.y);
   modelRoot.lookAt(face);
   modelRoot.rotateY(Math.PI);
 
@@ -124,6 +220,24 @@ function placeModelInFrontOfUser(distance = 0.7) {
   setTimeout(() => {
     if (!grabbing) halo.material.opacity = 0.0;
   }, 1800);
+}
+
+function layoutVoiceIndicator() {
+  if (!renderer.xr.isPresenting) {
+    voiceIndicatorGroup.visible = false;
+    return;
+  }
+  voiceIndicatorGroup.visible = true;
+
+  const cam = renderer.xr.getCamera();
+  cam.updateMatrixWorld(true);
+  cam.getWorldPosition(_camPos);
+  cam.getWorldQuaternion(_camQuat);
+
+  _forward.set(0, 0, -1).applyQuaternion(_camQuat).normalize();
+  voiceIndicatorGroup.position.copy(_camPos).addScaledVector(_forward, 0.45);
+  voiceIndicatorGroup.position.y = _camPos.y - 0.35;
+  voiceIndicatorGroup.quaternion.copy(_camQuat);
 }
 
 function prepareVisibleMaterials(root, hex) {
@@ -172,7 +286,6 @@ async function setModelFromResponse(data) {
   if (data.glb_url && data.rebuilt) {
     const bust = `${data.glb_url}${data.glb_url.includes("?") ? "&" : "?"}t=${Date.now()}`;
     const sceneObj = await loadGlb(bust);
-    // Fit to ~22cm so it's obvious in passthrough
     const box = new THREE.Box3().setFromObject(sceneObj);
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
@@ -195,15 +308,21 @@ async function setModelFromResponse(data) {
       if (replyAudio) {
         try { replyAudio.pause(); } catch (_) {}
       }
+      setVoiceState(VoiceState.SPEAKING);
       replyAudio = new Audio(data.reply_audio_url);
-      replyAudio.play().catch(() => {});
-    } catch (_) {}
+      replyAudio.onended = () => setVoiceState(VoiceState.IDLE);
+      replyAudio.onerror = () => setVoiceState(VoiceState.IDLE);
+      replyAudio.play().catch(() => setVoiceState(VoiceState.IDLE));
+    } catch (_) {
+      setVoiceState(VoiceState.IDLE);
+    }
+  } else {
+    setVoiceState(VoiceState.IDLE);
   }
 }
 
-// --- Enter AR (passthrough) + DOM overlay for UI ---
+// --- Enter AR (passthrough) + DOM overlay for minimal controls ---
 const arBtn = ARButton.createButton(renderer, {
-  // Don't require local-floor — some Quest AR sessions reject the session if it's required
   optionalFeatures: ["local-floor", "hand-tracking", "dom-overlay"],
   domOverlay: { root: overlayRoot },
 });
@@ -216,17 +335,17 @@ renderer.xr.addEventListener("sessionstart", () => {
   renderer.setClearColor(0x000000, 0);
   needsUserPlacement = true;
   placeFrameCount = 0;
-  // Keep placeholder visible until a model exists so you always see *something*
   if (!currentModel) placeholder.visible = true;
-  setStatus("Look forward — placing model in front of you…", true);
+  setStatus("Entering passthrough AR…", true);
+  setVoiceState(VoiceState.IDLE);
 });
 renderer.xr.addEventListener("sessionend", () => {
   renderer.setClearColor(0x0a0c12, 1);
   needsUserPlacement = false;
-  setStatus("AR ended — tap Enter AR again for passthrough.");
+  setStatus("AR ended.");
+  voiceIndicatorGroup.visible = false;
 });
 
-// Desktop preview clear (not passthrough)
 renderer.setClearColor(0x0a0c12, 1);
 
 // --- Controllers + hands ---
@@ -236,7 +355,7 @@ const handModelFactory = new XRHandModelFactory();
 function setupHand(index) {
   const controller = renderer.xr.getController(index);
   scene.add(controller);
-  // Pointer ray for clicking 3D UI
+
   const ray = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, 0),
@@ -254,7 +373,6 @@ function setupHand(index) {
   hand.add(handModelFactory.createHandModel(hand, "mesh"));
   scene.add(hand);
 
-  // Pinch anchor: hand ROOT stays at origin in WebXR — joints move. We track pinch in world space.
   const pinchAnchor = new THREE.Object3D();
   scene.add(pinchAnchor);
 
@@ -264,109 +382,8 @@ function setupHand(index) {
 const left = setupHand(0);
 const right = setupHand(1);
 
-// --- In-headset 3D UI (DOM overlay often disappears in immersive) ---
-const xrUi = new THREE.Group();
-xrUi.visible = false;
-scene.add(xrUi);
-
-function makeCanvasButton(label, w = 512, h = 160, bg = "#4f8cff") {
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  const paint = (text, color) => {
-    ctx.clearRect(0, 0, w, h);
-    // rounded rect
-    const r = 36;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.moveTo(r, 0);
-    ctx.arcTo(w, 0, w, h, r);
-    ctx.arcTo(w, h, 0, h, r);
-    ctx.arcTo(0, h, 0, 0, r);
-    ctx.arcTo(0, 0, w, 0, r);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = "#ffffff";
-    ctx.font = "bold 64px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, w / 2, h / 2);
-  };
-  paint(label, bg);
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.28, 0.09),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthTest: false })
-  );
-  mesh.renderOrder = 10;
-  mesh.userData.paint = (text, color) => {
-    paint(text, color);
-    tex.needsUpdate = true;
-  };
-  mesh.userData.isTalkBtn = label.toLowerCase().includes("talk");
-  mesh.userData.isDemoBtn = label.toLowerCase().includes("demo");
-  return mesh;
-}
-
-const talk3d = makeCanvasButton("HOLD TO TALK", 512, 160, "#4f8cff");
-talk3d.position.set(0, 0.06, 0);
-xrUi.add(talk3d);
-
-const demo3d = makeCanvasButton("DEMO RING", 512, 160, "#3a4664");
-demo3d.position.set(0, -0.05, 0);
-xrUi.add(demo3d);
-
-const status3dCanvas = document.createElement("canvas");
-status3dCanvas.width = 768;
-status3dCanvas.height = 128;
-const status3dCtx = status3dCanvas.getContext("2d");
-const status3dTex = new THREE.CanvasTexture(status3dCanvas);
-status3dTex.colorSpace = THREE.SRGBColorSpace;
-const status3d = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.42, 0.07),
-  new THREE.MeshBasicMaterial({ map: status3dTex, transparent: true, side: THREE.DoubleSide, depthTest: false })
-);
-status3d.position.set(0, 0.15, 0);
-status3d.renderOrder = 10;
-xrUi.add(status3d);
-
-function setXrStatus(msg) {
-  const ctx = status3dCtx;
-  const w = status3dCanvas.width;
-  const h = status3dCanvas.height;
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = "#e8eefc";
-  ctx.font = "28px system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  const line = msg.length > 54 ? `${msg.slice(0, 51)}…` : msg;
-  ctx.fillText(line, w / 2, h / 2);
-  status3dTex.needsUpdate = true;
-}
-
-function layoutXrUi() {
-  if (!renderer.xr.isPresenting) {
-    xrUi.visible = false;
-    return;
-  }
-  xrUi.visible = true;
-  const cam = renderer.xr.getCamera();
-  cam.updateMatrixWorld(true);
-  cam.getWorldPosition(_camPos);
-  cam.getWorldQuaternion(_camQuat);
-  _forward.set(0, 0, -1).applyQuaternion(_camQuat).normalize();
-  // Dock UI lower-center in view so it doesn't cover the model
-  xrUi.position.copy(_camPos).addScaledVector(_forward, 0.55);
-  xrUi.position.y = _camPos.y - 0.28;
-  xrUi.quaternion.copy(_camQuat);
-}
-
-// Interaction state
-let grabSource = null; // pinchAnchor we follow
+// --- Interaction state (improved pinch) ---
+let grabSource = null;
 let grabHandKey = -1;
 const grabOffset = new THREE.Matrix4();
 const tempMatrix = new THREE.Matrix4();
@@ -376,8 +393,12 @@ const _pinch = new THREE.Vector3();
 const _modelCenter = new THREE.Vector3();
 const _wristQuat = new THREE.Quaternion();
 let wasPinching = { 0: false, 1: false };
-let pokeTalking = false;
-let demoPoked = false;
+let pinchStartTime = { 0: 0, 1: 0 };
+
+const PINCH_THRESHOLD_START = 0.032;
+const PINCH_THRESHOLD_END = 0.045;
+const PINCH_MIN_DURATION_MS = 50;
+const GRAB_RANGE = 0.20;
 
 function modelInteractTarget() {
   return currentModel || (placeholder.visible ? placeholder : null);
@@ -414,7 +435,7 @@ function updatePinchAnchor(handEntry) {
   return gap;
 }
 
-function nearModel(worldPos, pad = 0.16) {
+function nearModel(worldPos, pad = GRAB_RANGE) {
   const target = modelInteractTarget();
   if (!target) return false;
   const box = new THREE.Box3().setFromObject(target);
@@ -431,7 +452,7 @@ function beginGrab(anchor, key) {
   tempMatrix.copy(grabSource.matrixWorld).invert();
   grabOffset.multiplyMatrices(tempMatrix, modelRoot.matrixWorld);
   halo.material.opacity = 0.9;
-  setStatus("Grabbing — move hand to move, twist to spin.", true);
+  halo.material.color.setHex(0x00ff88);
 }
 
 function endGrab() {
@@ -439,6 +460,7 @@ function endGrab() {
   grabSource = null;
   grabHandKey = -1;
   halo.material.opacity = 0.0;
+  halo.material.color.setHex(0x4f8cff);
 }
 
 function updateGrab() {
@@ -455,152 +477,92 @@ function pollHand(handEntry, key) {
   if (gap === null) {
     if (wasPinching[key] && grabHandKey === key) endGrab();
     wasPinching[key] = false;
+    pinchStartTime[key] = 0;
     return;
   }
 
-  const pinching = gap < 0.035;
+  const now = performance.now();
   const pos = handEntry.pinchAnchor.position;
+
+  const isPinching = gap < PINCH_THRESHOLD_START;
+  const wasOpen = gap > PINCH_THRESHOLD_END;
 
   if (!grabbing) {
     getModelCenter(_modelCenter);
     const dist = pos.distanceTo(_modelCenter);
-    if (dist < 0.22) halo.material.opacity = Math.max(halo.material.opacity, 0.4);
+    if (dist < GRAB_RANGE) {
+      halo.material.opacity = Math.max(halo.material.opacity, 0.4 + (1 - dist / GRAB_RANGE) * 0.3);
+    }
   }
 
-  // Pinch near model → grab+spin (either hand)
-  if (pinching && !wasPinching[key]) {
-    if (nearModel(pos, 0.18)) {
+  if (isPinching && !wasPinching[key]) {
+    pinchStartTime[key] = now;
+  }
+
+  if (isPinching && wasPinching[key] && !grabbing) {
+    const duration = now - pinchStartTime[key];
+    if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
       beginGrab(handEntry.pinchAnchor, key);
     }
   }
-  if (!pinching && wasPinching[key] && grabHandKey === key) {
+
+  if (wasOpen && wasPinching[key] && grabHandKey === key) {
     endGrab();
   }
 
-  // Index fingertip poke on 3D talk / demo buttons
-  const indexJoint = handEntry.hand.joints?.["index-finger-tip"];
-  if (indexJoint && xrUi.visible) {
-    indexJoint.getWorldPosition(_indexTip);
-    const talkDist = _indexTip.distanceTo(talk3d.getWorldPosition(_modelCenter));
-    // reuse vectors carefully
-    talk3d.getWorldPosition(_modelCenter);
-    const dTalk = _indexTip.distanceTo(_modelCenter);
-    demo3d.getWorldPosition(_camPos); // temp
-    const dDemo = _indexTip.distanceTo(_camPos);
-
-    if (dTalk < 0.06) {
-      if (!pokeTalking && !grabbing) {
-        pokeTalking = true;
-        startTalk();
-        talk3d.userData.paint("LISTENING…", "#e53935");
-      }
-    } else if (pokeTalking && key === 0) {
-      // only end poke-talk when left index leaves (or both checked below)
-    }
-
-    if (dDemo < 0.06 && !demoPoked) {
-      demoPoked = true;
-      sendCommand("build me a ring").catch((e) => setStatus(e.message));
-    } else if (dDemo >= 0.08) {
-      demoPoked = false;
-    }
-  }
-
-  wasPinching[key] = pinching;
+  wasPinching[key] = isPinching;
 }
 
-function pollPokeRelease() {
-  if (!pokeTalking) return;
-  // End talk when BOTH index tips are away from talk button
-  let near = false;
-  for (const entry of [left, right]) {
-    const tip = entry.hand.joints?.["index-finger-tip"];
-    if (!tip) continue;
-    tip.getWorldPosition(_indexTip);
-    talk3d.getWorldPosition(_modelCenter);
-    if (_indexTip.distanceTo(_modelCenter) < 0.07) near = true;
-  }
-  if (!near) {
-    pokeTalking = false;
-    stopTalk();
-    talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
-  }
-}
-
-// Controller: squeeze = talk, select ray on UI or grab model
-const xrRaycaster = new THREE.Raycaster();
-const _rayOrig = new THREE.Vector3();
-const _rayDir = new THREE.Vector3();
-
-function controllerSelectUi(controller) {
-  controller.getWorldPosition(_rayOrig);
-  _rayDir.set(0, 0, -1).applyQuaternion(controller.getWorldQuaternion(_camQuat)).normalize();
-  xrRaycaster.set(_rayOrig, _rayDir);
-  const hits = xrRaycaster.intersectObjects([talk3d, demo3d], false);
-  if (!hits.length) return null;
-  return hits[0].object;
-}
-
-function onControllerSelectStart(controller) {
-  const ui = controllerSelectUi(controller);
-  if (ui?.userData.isTalkBtn) {
-    startTalk();
-    talk3d.userData.paint("LISTENING…", "#e53935");
-    controller.userData.talking = true;
-    return;
-  }
-  if (ui?.userData.isDemoBtn) {
-    sendCommand("build me a ring").catch((e) => setStatus(e.message));
-    return;
-  }
-  controller.getWorldPosition(_pinch);
-  if (nearModel(_pinch, 0.22)) beginGrab(controller, -1);
-}
-
-function onControllerSelectEnd(controller) {
-  if (controller.userData.talking) {
-    controller.userData.talking = false;
-    stopTalk();
-    talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
-  }
-  if (grabSource === controller) endGrab();
-}
-
+// --- Controller squeeze for voice (push-to-talk via hardware) ---
 for (const entry of [left, right]) {
-  entry.controller.addEventListener("selectstart", () => onControllerSelectStart(entry.controller));
-  entry.controller.addEventListener("selectend", () => onControllerSelectEnd(entry.controller));
   entry.controller.addEventListener("squeezestart", () => {
-    startTalk();
-    talk3d.userData.paint("LISTENING…", "#e53935");
-    entry.controller.userData.squeezeTalk = true;
+    if (!isMuted) {
+      startTalk();
+      entry.controller.userData.squeezeTalk = true;
+    }
   });
   entry.controller.addEventListener("squeezeend", () => {
     if (entry.controller.userData.squeezeTalk) {
       entry.controller.userData.squeezeTalk = false;
       stopTalk();
-      talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
     }
+  });
+
+  entry.controller.addEventListener("selectstart", () => {
+    entry.controller.getWorldPosition(_pinch);
+    if (nearModel(_pinch, GRAB_RANGE)) beginGrab(entry.controller, -1);
+  });
+  entry.controller.addEventListener("selectend", () => {
+    if (grabSource === entry.controller) endGrab();
   });
 }
 
 // --- API ---
 async function sendCommand(text) {
-  setStatus(`Thinking: “${text}”…`);
-  const res = await fetch(`${API_BASE}/api/command`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, session_id: SESSION_ID }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  await setModelFromResponse(data);
-  const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
-  setStatus(`${data.reply}${ms}`, data.ok);
-  return data;
+  setVoiceState(VoiceState.THINKING);
+  setStatus(`Thinking: "${text}"…`);
+  try {
+    const res = await fetch(`${API_BASE}/api/command`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, session_id: SESSION_ID }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    await setModelFromResponse(data);
+    const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
+    setStatus(`${data.reply}${ms}`, data.ok);
+    return data;
+  } catch (err) {
+    setVoiceState(VoiceState.ERROR);
+    setStatus(`Error: ${err.message}`);
+    throw err;
+  }
 }
 
 async function sendVoice(blob, attempt = 1) {
-  setStatus("Got it — working…");
+  setVoiceState(VoiceState.THINKING);
+  setStatus("Processing…");
   const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
   const form = new FormData();
   form.append("audio", blob, `utterance.${ext}`);
@@ -616,22 +578,23 @@ async function sendVoice(blob, attempt = 1) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     await setModelFromResponse(data);
-    const heard = data.transcript ? `Heard: “${data.transcript}”. ` : "";
+    const heard = data.transcript ? `"${data.transcript}"` : "";
     const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
-    setStatus(`${heard}${data.reply}${ms}`, data.ok);
+    setStatus(`${heard} ${data.reply}${ms}`, data.ok);
     return data;
   } catch (err) {
     if (attempt < 2 && err.name !== "AbortError") {
-      setStatus("Retrying voice…");
+      setStatus("Retrying…");
       return sendVoice(blob, attempt + 1);
     }
+    setVoiceState(VoiceState.ERROR);
     throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// --- Hold to talk → release auto-sends ---
+// --- Voice recording ---
 let mediaStream = null;
 let mediaRecorder = null;
 let chunks = [];
@@ -656,16 +619,16 @@ async function getMicStream() {
 
 async function flushVoice(blob) {
   voiceBusy = true;
-  talkBtn.disabled = true;
+  if (talkBtn) talkBtn.disabled = true;
   try {
     await sendVoice(blob);
   } catch (err) {
     const msg = err.name === "AbortError" ? "timed out" : err.message;
-    setStatus(`Voice failed: ${msg}. Hold to talk and try again.`);
+    setStatus(`Voice failed: ${msg}`);
+    setVoiceState(VoiceState.ERROR);
   } finally {
     voiceBusy = false;
-    talkBtn.disabled = false;
-    talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
+    if (talkBtn) talkBtn.disabled = false;
     if (pendingBlob) {
       const next = pendingBlob;
       pendingBlob = null;
@@ -675,7 +638,7 @@ async function flushVoice(blob) {
 }
 
 async function startTalk() {
-  if (recording) return;
+  if (recording || isMuted) return;
   try {
     if (replyAudio) {
       try { replyAudio.pause(); } catch (_) {}
@@ -692,18 +655,20 @@ async function startTalk() {
     };
     mediaRecorder.onstop = async () => {
       recording = false;
-      talkBtn.classList.remove("recording");
-      talkBtn.textContent = "Hold to talk";
-      talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
+      if (talkBtn) {
+        talkBtn.classList.remove("recording");
+        talkBtn.textContent = "Hold to talk";
+      }
       const blob = new Blob(chunks, { type: usedMime });
       chunks = [];
       if (blob.size < 400) {
-        setStatus("Hold a little longer, then release.");
+        setStatus("Hold longer, then release.");
+        setVoiceState(VoiceState.IDLE);
         return;
       }
       if (voiceBusy) {
         pendingBlob = blob;
-        setStatus("Queued — sending when ready…");
+        setStatus("Queued…");
         return;
       }
       await flushVoice(blob);
@@ -711,13 +676,16 @@ async function startTalk() {
 
     mediaRecorder.start(100);
     recording = true;
-    talkBtn.classList.add("recording");
-    talkBtn.textContent = "Listening…";
-    talk3d.userData.paint("LISTENING…", "#e53935");
-    setStatus("Listening… release to send.");
+    setVoiceState(VoiceState.LISTENING);
+    if (talkBtn) {
+      talkBtn.classList.add("recording");
+      talkBtn.textContent = "Listening…";
+    }
+    setStatus("Listening…");
   } catch (err) {
     recording = false;
     setStatus(`Mic error: ${err.message}`);
+    setVoiceState(VoiceState.ERROR);
   }
 }
 
@@ -728,30 +696,56 @@ function stopTalk() {
     try { mediaRecorder.stop(); } catch (_) {}
   } else {
     recording = false;
-    talkBtn.classList.remove("recording");
-    talkBtn.textContent = "Hold to talk";
-    talk3d.userData.paint("HOLD TO TALK", "#4f8cff");
+    if (talkBtn) {
+      talkBtn.classList.remove("recording");
+      talkBtn.textContent = "Hold to talk";
+    }
+    setVoiceState(VoiceState.IDLE);
   }
 }
 
-// HTML button (desktop / before immersive)
-talkBtn.addEventListener("pointerdown", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  talkBtn.setPointerCapture?.(e.pointerId);
-  startTalk();
-});
-talkBtn.addEventListener("pointerup", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  stopTalk();
-});
-talkBtn.addEventListener("pointercancel", () => stopTalk());
-talkBtn.addEventListener("lostpointercapture", () => stopTalk());
+// --- Mute toggle (public API for external integration) ---
+function toggleMute() {
+  isMuted = !isMuted;
+  updateVoiceIndicator();
+  if (isMuted && recording) stopTalk();
+  return isMuted;
+}
 
-demoBtn.addEventListener("click", () => {
-  sendCommand("build me a ring").catch((err) => setStatus(err.message));
-});
+// Export VoiceState API for external hooks (Tabish/Taha wake-word integration)
+window.PerceptionCAD = {
+  VoiceState,
+  getVoiceState: () => currentVoiceState,
+  setVoiceState,
+  isMuted: () => isMuted,
+  toggleMute,
+  startTalk,
+  stopTalk,
+  sendCommand,
+};
+
+// --- HTML buttons (debug HUD only) ---
+if (talkBtn) {
+  talkBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    talkBtn.setPointerCapture?.(e.pointerId);
+    startTalk();
+  });
+  talkBtn.addEventListener("pointerup", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    stopTalk();
+  });
+  talkBtn.addEventListener("pointercancel", () => stopTalk());
+  talkBtn.addEventListener("lostpointercapture", () => stopTalk());
+}
+
+if (demoBtn) {
+  demoBtn.addEventListener("click", () => {
+    sendCommand("build me a ring").catch((err) => setStatus(err.message));
+  });
+}
 
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -759,26 +753,46 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+// --- Animation pulse for voice indicator ---
+let pulsePhase = 0;
+
 renderer.setAnimationLoop(() => {
   if (needsUserPlacement && renderer.xr.isPresenting) {
     placeFrameCount += 1;
     if (placeFrameCount >= 3) {
       placeModelInFrontOfUser(0.7);
       needsUserPlacement = false;
-      setStatus(
-        currentModel
-          ? "Pinch the model to grab/spin. Squeeze or poke HOLD TO TALK."
-          : "Poke DEMO RING or squeeze to talk.",
-        true
-      );
+      setStatus(currentModel ? "Pinch model to grab/spin. Squeeze to talk." : "Squeeze to talk.", true);
     }
   }
 
-  layoutXrUi();
+  layoutVoiceIndicator();
+
+  if (voiceIndicatorGroup.visible) {
+    pulsePhase += 0.08;
+    if (currentVoiceState === VoiceState.LISTENING) {
+      const pulse = 1.0 + 0.15 * Math.sin(pulsePhase * 2);
+      voiceRing.scale.setScalar(pulse);
+      voiceDot.scale.setScalar(pulse);
+    } else if (currentVoiceState === VoiceState.THINKING) {
+      const spin = pulsePhase * 0.5;
+      voiceRing.rotation.z = spin;
+    } else if (currentVoiceState === VoiceState.SPEAKING) {
+      const pulse = 1.0 + 0.1 * Math.sin(pulsePhase * 3);
+      voiceDot.scale.setScalar(pulse);
+    }
+  }
+
   pollHand(left, 0);
   pollHand(right, 1);
-  pollPokeRelease();
   updateGrab();
+
+  if (!grabbing) {
+    const decay = 0.92;
+    halo.material.opacity *= decay;
+    if (halo.material.opacity < 0.01) halo.material.opacity = 0;
+  }
+
   renderer.render(scene, camera);
 });
 
@@ -817,9 +831,6 @@ window.addEventListener("pointermove", (e) => {
 fetch(`${API_BASE}/api/health`)
   .then((r) => r.json())
   .then((h) => {
-    setStatus(
-      `Ready · CadQuery ${h.cadquery ? "on" : "off"} · voice ${h.stt && h.tts ? "on" : "partial"}`,
-      true
-    );
+    setStatus(`Ready · CadQuery ${h.cadquery ? "on" : "off"} · voice ${h.stt && h.tts ? "on" : "partial"}`, true);
   })
   .catch(() => setStatus("API offline — start backend on :8000"));

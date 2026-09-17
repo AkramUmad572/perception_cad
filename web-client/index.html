@@ -36,10 +36,12 @@
         position: fixed; top: 16px; right: 16px; z-index: 12;
       }
 
+      /* Legacy HUD - hidden by default, enable via ?debug=hud */
       #hud {
         position: fixed; left: 12px; right: 12px; bottom: 18px;
-        display: flex; justify-content: center;
+        display: none; justify-content: center;
       }
+      #hud.debug-visible { display: flex; }
       .panel {
         pointer-events: auto;
         background: var(--panel);
@@ -65,6 +67,24 @@
       button.recording { background: var(--rec); transform: scale(1.04); }
       #talkBtn { min-width: 180px; min-height: 52px; }
       .hint { margin-top: 8px; font-size: 12px; color: var(--muted); opacity: 0.9; }
+
+      /* Minimal status indicator - always visible when in debug mode */
+      #minimalStatus {
+        position: fixed;
+        bottom: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--panel);
+        backdrop-filter: blur(8px);
+        border-radius: 8px;
+        padding: 6px 12px;
+        font-size: 12px;
+        color: var(--muted);
+        display: none;
+        pointer-events: none;
+      }
+      #minimalStatus.debug-visible { display: block; }
+      #minimalStatus.ok { color: var(--ok); }
     </style>
   </head>
   <body>
@@ -72,6 +92,7 @@
     <button id="arButton" class="secondary hit">Enter AR</button>
 
     <div id="overlay">
+      <!-- Legacy HUD - hidden by default -->
       <div id="hud">
         <div class="panel hit">
           <h1>Perception CAD</h1>
@@ -87,6 +108,9 @@
           </p>
         </div>
       </div>
+
+      <!-- Minimal debug status (small text, only shown with ?debug) -->
+      <div id="minimalStatus"></div>
     </div>
 
     <script type="module" src="/src/main.js"></script>
