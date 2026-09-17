@@ -1,9 +1,14 @@
 """
 CadQuery model builder with sandboxed freeform execution.
 
-Supports:
-- Legacy template builds (ring/box/cylinder) for backward compat
-- Freeform CadQuery script execution via sandbox
+PRIMARY PATH (free-rein):
+- ai.intent generates CadQuery Python for ANY shape user describes
+- pipeline executes via execute_cadquery (sandbox) with retry loop
+- No whitelist restrictions on shapes
+
+LEGACY PATH (backward compat only):
+- Template-based builds (ring/box/cylinder) in build_model()
+- Used only when action="create" with known template name
 """
 
 from __future__ import annotations

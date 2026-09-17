@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
-
-
-TemplateName = Literal["ring", "box", "cylinder"]
-ActionName = Literal["create", "modify", "set_material", "execute_script", "noop", "clarify"]
 
 
 class CadParams(BaseModel):
@@ -22,8 +18,8 @@ class CadParams(BaseModel):
 
 
 class Intent(BaseModel):
-    action: ActionName = "noop"
-    template: TemplateName | None = None
+    action: str = "noop"
+    template: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     script: str | None = None
     reply: str = "Okay."
@@ -43,7 +39,7 @@ class ScriptRequest(BaseModel):
 
 class SessionState(BaseModel):
     session_id: str = "default"
-    template: TemplateName | None = None
+    template: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     color: str = "#C0C0C0"
     model_id: str | None = None
@@ -55,7 +51,7 @@ class CommandResponse(BaseModel):
     ok: bool = True
     transcript: str | None = None
     reply: str
-    action: ActionName
+    action: str
     rebuilt: bool = False
     color: str | None = None
     glb_url: str | None = None

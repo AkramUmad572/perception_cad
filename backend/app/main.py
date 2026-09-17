@@ -82,7 +82,7 @@ async def command(body: CommandRequest):
     t_all = time.perf_counter()
     session = get_session(body.session_id)
     intent, intent_ms = await parse_intent(
-        body.text, settings, session.template, session.params
+        body.text, settings, session.template, session.params, session.last_script
     )
     result = await apply_intent(
         intent,
@@ -152,7 +152,7 @@ async def voice(
             )
 
         intent, intent_ms = await parse_intent(
-            transcript, settings, session.template, session.params
+            transcript, settings, session.template, session.params, session.last_script
         )
         result = await apply_intent(
             intent,

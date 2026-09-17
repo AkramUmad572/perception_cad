@@ -1,4 +1,4 @@
-"""LLM intent parsing: natural language → structured CAD ops."""
+"""LLM intent parsing: natural language → CadQuery Python codegen (free-rein)."""
 
 from __future__ import annotations
 
@@ -10,62 +10,208 @@ from typing import Any
 
 from app.config import Settings
 from app.models import Intent
-from cad.builder import DEFAULTS
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You convert spoken CAD commands into JSON for a parametric CAD system.
-Templates: ring, box, cylinder.
-Synonyms: cube/block/square → box; tube/pipe/rod/can → cylinder; donut/band/torus → ring.
+CODEGEN_SYSTEM_PROMPT = """You are a CadQuery Python code generator for a voice-controlled CAD system.
 
-Actions:
-- create: make a new model (set template + params). If the user names a color, include "color" in params.
-- modify: change numeric params of the current model
-- set_material: change color only (hex like #FFD700 or name mapped to hex)
-- noop: nothing to do
-- clarify: need more info
+When the user describes ANY 3D shape or object, you generate working CadQuery Python code.
+You can make ANYTHING the user asks for — there are no restrictions on shape types.
 
-Color map: yellow/gold=#FFD700, red=#E53935, blue=#1E88E5, green=#43A047,
-silver/grey/gray=#C0C0C0, black=#212121, white=#FAFAFA, orange=#FB8C00, purple=#8E24AA, pink=#EC407A.
+## Output Format
+Return ONLY valid JSON:
+{
+  "action": "generate",
+  "script": "import cadquery as cq\\nresult = ...",
+  "reply": "Building a [description]."
+}
 
-Params (mm):
-ring: inner_diameter_mm, outer_diameter_mm, height_mm, color
-  - "thicker band" → increase height_mm and outer-inner gap
-  - "thinner" → decrease those
-  - "small" → scale down sizes ~0.75x from defaults; "large" ~1.4x
-box: width_mm, depth_mm, height_mm, color
-cylinder: diameter_mm, height_mm, color
-"bigger"/"larger" → scale all *_mm by 1.25; "smaller" → 0.8
+Or for non-CAD requests:
+{
+  "action": "set_material",
+  "params": {"color": "#HEXCODE"},
+  "reply": "Changed the color."
+}
 
-Fix obvious speech-to-text errors (bring→ring, rink→ring, boxes→box).
+Or if you need clarification:
+{
+  "action": "clarify",
+  "reply": "Could you describe what shape you'd like?"
+}
 
-Return ONLY JSON:
-{"action":"...","template":"ring|box|cylinder|null","params":{},"reply":"short spoken confirmation"}
+## Script Requirements
+1. Script MUST start with `import cadquery as cq`
+2. Script MUST define `result` variable with the final CadQuery workplane/solid
+3. Use millimeters for all dimensions
+4. Default to reasonable sizes (10-50mm) unless user specifies
+5. Code must be syntactically valid Python
+
+## CadQuery Examples
+
+Simple box:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(30, 20, 10)
+```
+
+Ring/torus:
+```python
+import cadquery as cq
+outer_r, inner_r, height = 11, 9, 4
+result = cq.Workplane("XY").circle(outer_r).circle(inner_r).extrude(height)
+```
+
+Cylinder:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").circle(15).extrude(40)
+```
+
+Sphere:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").sphere(20)
+```
+
+Cone:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").circle(20).workplane(offset=30).circle(0.1).loft()
+```
+
+Pyramid:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").rect(30, 30).workplane(offset=25).rect(1, 1).loft()
+```
+
+Hexagonal prism:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").polygon(6, 20).extrude(15)
+```
+
+Star shape:
+```python
+import cadquery as cq
+import math
+pts = []
+for i in range(10):
+    angle = i * math.pi / 5
+    r = 20 if i % 2 == 0 else 10
+    pts.append((r * math.cos(angle), r * math.sin(angle)))
+result = cq.Workplane("XY").polyline(pts).close().extrude(5)
+```
+
+Box with hole:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(30, 30, 20).faces(">Z").workplane().hole(10)
+```
+
+Rounded box (fillet):
+```python
+import cadquery as cq
+result = cq.Workplane("XY").box(30, 20, 15).edges().fillet(3)
+```
+
+Text extrusion:
+```python
+import cadquery as cq
+result = cq.Workplane("XY").text("Hi", 10, 3)
+```
+
+Gear-like shape:
+```python
+import cadquery as cq
+import math
+n_teeth = 12
+outer_r, inner_r = 25, 20
+pts = []
+for i in range(n_teeth * 2):
+    angle = i * math.pi / n_teeth
+    r = outer_r if i % 2 == 0 else inner_r
+    pts.append((r * math.cos(angle), r * math.sin(angle)))
+result = cq.Workplane("XY").polyline(pts).close().extrude(8).faces(">Z").workplane().hole(10)
+```
+
+Vase (revolved profile):
+```python
+import cadquery as cq
+pts = [(0, 0), (20, 0), (15, 30), (18, 50), (10, 60), (10, 65), (18, 65), (20, 50), (17, 30), (22, 0)]
+result = cq.Workplane("XZ").polyline(pts).close().revolve(360, (0, 0, 0), (0, 1, 0))
+```
+
+Heart shape:
+```python
+import cadquery as cq
+import math
+pts = []
+for t_int in range(100):
+    t = t_int * 2 * math.pi / 100
+    x = 16 * (math.sin(t) ** 3)
+    y = 13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t)
+    pts.append((x, y))
+result = cq.Workplane("XY").polyline(pts).close().extrude(5)
+```
+
+## Color Handling
+For "make it yellow", "change color to blue", etc:
+- action: "set_material"
+- params: {"color": "#HEXCODE"}
+
+Color map: yellow=#FFD700, red=#E53935, blue=#1E88E5, green=#43A047,
+silver/grey=#C0C0C0, black=#212121, white=#FAFAFA, orange=#FB8C00, purple=#8E24AA, pink=#EC407A
+
+## Modification Handling
+For "make it bigger", "make it taller", etc. when there's existing code:
+- Modify the dimensions in the current script proportionally
+- action: "generate" with updated script
+
+## Speech-to-text corrections
+Common STT errors: bring/rink→ring, cubes→box, yello→yellow, bill me→build me
 """
 
-# Common STT mis-hearings → intended CAD words
+REPAIR_PROMPT = """The previous CadQuery script failed with this error:
+{error}
+
+Original script:
+```python
+{script}
+```
+
+Fix the script to resolve the error. Common issues:
+- Syntax errors: check parentheses, quotes, indentation
+- Invalid operations: some CadQuery methods don't work on all shapes
+- Division issues: ensure no division by zero
+- Import errors: only 'cadquery' and 'math' are available
+
+Return ONLY the corrected JSON:
+{{"action": "generate", "script": "...", "reply": "Fixed: [brief description]"}}
+"""
+
+COLOR_MAP = {
+    "yellow": "#FFD700", "gold": "#FFD700",
+    "red": "#E53935", "crimson": "#DC143C",
+    "blue": "#1E88E5", "navy": "#000080",
+    "green": "#43A047", "lime": "#32CD32",
+    "silver": "#C0C0C0", "grey": "#C0C0C0", "gray": "#C0C0C0",
+    "black": "#212121",
+    "white": "#FAFAFA",
+    "orange": "#FB8C00",
+    "purple": "#8E24AA", "violet": "#8E24AA",
+    "pink": "#EC407A",
+    "brown": "#795548",
+    "cyan": "#00BCD4", "teal": "#009688",
+}
+
 _STT_FIXES = [
-    (r"\bbrings?\b", "ring"),
-    (r"\brinks?\b", "ring"),
-    (r"\bwrings?\b", "ring"),
-    (r"\brang\b", "ring"),
-    (r"\bwrong\b", "ring"),
-    (r"\bdonut\b", "ring"),
-    (r"\bdoughnut\b", "ring"),
-    (r"\btorus\b", "ring"),
-    (r"\bcubes?\b", "box"),
-    (r"\bblocks?\b", "box"),
-    (r"\bsquares?\b", "box"),
-    (r"\btubes?\b", "cylinder"),
-    (r"\bpipes?\b", "cylinder"),
-    (r"\bcylinders?\b", "cylinder"),
-    (r"\bbill me\b", "build me"),
-    (r"\bbuilt me\b", "build me"),
-    (r"\bbuilding me\b", "build me"),
-    (r"\bmake me a\b", "build me a"),
-    (r"\bcreate me a\b", "build me a"),
-    (r"\byello\b", "yellow"),
-    (r"\bmellow\b", "yellow"),
+    (r"\bbrings?\b", "ring"), (r"\brinks?\b", "ring"), (r"\bwrings?\b", "ring"),
+    (r"\brang\b", "ring"), (r"\bwrong\b", "ring"),
+    (r"\bcubes?\b", "box"), (r"\bblocks?\b", "box"),
+    (r"\btubes?\b", "cylinder"), (r"\bpipes?\b", "cylinder"),
+    (r"\bbill me\b", "build me"), (r"\bbuilt me\b", "build me"),
+    (r"\byello\b", "yellow"), (r"\bmellow\b", "yellow"),
 ]
 
 
@@ -78,238 +224,118 @@ def _normalize_transcript(text: str) -> str:
     return lower.strip()
 
 
-def _rule_based_intent(
-    text: str, current_template: str | None, current_params: dict[str, Any]
-) -> Intent:
-    t = _normalize_transcript(text)
-    logger.info("Intent rules on: %r", t)
-
-    color_map = {
-        "yellow": "#FFD700",
-        "gold": "#FFD700",
-        "red": "#E53935",
-        "blue": "#1E88E5",
-        "green": "#43A047",
-        "silver": "#C0C0C0",
-        "grey": "#C0C0C0",
-        "gray": "#C0C0C0",
-        "black": "#212121",
-        "white": "#FAFAFA",
-        "orange": "#FB8C00",
-        "purple": "#8E24AA",
-        "pink": "#EC407A",
-    }
-
-    # Color — any mention of a color word with make/change/paint/to, or just "yellow"
-    for name, hex_color in color_map.items():
+def _check_color_only(text: str) -> Intent | None:
+    """Fast path: detect pure color-change requests."""
+    t = text.lower()
+    for name, hex_color in COLOR_MAP.items():
         if re.search(rf"\b{name}\b", t):
-            if (
-                "color" in t
-                or "make it" in t
-                or "make this" in t
-                or "change" in t
-                or "paint" in t
-                or f"to {name}" in t
-                or t.strip() == name
-                or re.search(rf"\b(it|this|that)\s+{name}\b", t)
-            ):
+            if any(kw in t for kw in ["color", "make it", "make this", "change", "paint", f"to {name}"]):
                 return Intent(
                     action="set_material",
                     params={"color": hex_color},
-                    reply=f"Made it {name}.",
+                    reply=f"Changed to {name}.",
                 )
-
-    # Create — ring / box / cylinder (+ synonyms already normalized)
-    create_map = {
-        "ring": ["ring", "rings"],
-        "box": ["box", "boxes"],
-        "cylinder": ["cylinder", "cylinders"],
-    }
-    color_in_utterance = None
-    for name, hex_color in color_map.items():
-        if re.search(rf"\b{name}\b", t):
-            color_in_utterance = (name, hex_color)
-            break
-
-    scale = 1.0
-    if re.search(r"\b(small|tiny|little)\b", t):
-        scale = 0.75
-    elif re.search(r"\b(large|big|huge)\b", t):
-        scale = 1.4
-
-    for template, words in create_map.items():
-        for w in words:
-            if re.search(
-                rf"\b(build|make|create|generate|spawn|add|give)\b.*\b{w}\b", t
-            ) or re.search(rf"\b(a|an)\s+{w}\b", t):
-                params = dict(DEFAULTS[template])
-                for k, v in list(params.items()):
-                    if isinstance(v, (int, float)) and k.endswith("_mm"):
-                        params[k] = round(float(v) * scale, 2)
-                reply = f"Building a {template}."
-                if color_in_utterance:
-                    params["color"] = color_in_utterance[1]
-                    reply = f"Building a {color_in_utterance[0]} {template}."
+            if t.strip() == name:
                 return Intent(
-                    action="create",
-                    template=template,  # type: ignore[arg-type]
-                    params=params,
-                    reply=reply,
+                    action="set_material",
+                    params={"color": hex_color},
+                    reply=f"Changed to {name}.",
                 )
-            if t.strip() in {w, f"a {w}", f"an {w}"}:
-                params = dict(DEFAULTS[template])
-                if color_in_utterance:
-                    params["color"] = color_in_utterance[1]
-                return Intent(
-                    action="create",
-                    template=template,  # type: ignore[arg-type]
-                    params=params,
-                    reply=f"Building a {template}.",
-                )
+    return None
 
-    # Thicker / thinner (ring band or generic height)
-    if current_template and ("thicker" in t or "thicken" in t):
-        if current_template == "ring":
-            height = float(current_params.get("height_mm", 4.0)) + 2.0
-            outer = float(current_params.get("outer_diameter_mm", 22.0))
-            inner = float(current_params.get("inner_diameter_mm", 18.0))
-            outer = max(outer, inner + 6.0)
-            return Intent(
-                action="modify",
-                template="ring",
-                params={"height_mm": height, "outer_diameter_mm": outer},
-                reply="Making the band thicker.",
-            )
-        height = float(current_params.get("height_mm", 20.0)) * 1.3
+
+def _check_scale_modify(text: str, current_script: str | None) -> Intent | None:
+    """Fast path: detect scale/size modification requests."""
+    if not current_script:
+        return None
+    t = text.lower()
+    
+    scale = None
+    direction = None
+    if any(w in t for w in ["bigger", "larger", "scale up"]):
+        scale, direction = 1.25, "bigger"
+    elif any(w in t for w in ["smaller", "scale down", "shrink"]):
+        scale, direction = 0.8, "smaller"
+    elif any(w in t for w in ["taller", "higher"]):
+        scale, direction = 1.35, "taller"
+    elif any(w in t for w in ["shorter", "lower"]):
+        scale, direction = 0.7, "shorter"
+    elif any(w in t for w in ["thicker", "wider"]):
+        scale, direction = 1.3, "thicker"
+    elif any(w in t for w in ["thinner", "narrower"]):
+        scale, direction = 0.75, "thinner"
+    
+    if scale is None:
+        return None
+    
+    modified = _scale_dimensions_in_script(current_script, scale, direction)
+    if modified != current_script:
         return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params={"height_mm": height},
-            reply="Making it thicker.",
+            action="generate",
+            script=modified,
+            reply=f"Made it {direction}.",
         )
-
-    if current_template and ("thinner" in t or "skinny" in t):
-        if current_template == "ring":
-            height = max(1.5, float(current_params.get("height_mm", 4.0)) - 1.5)
-            outer = float(current_params.get("outer_diameter_mm", 22.0))
-            inner = float(current_params.get("inner_diameter_mm", 18.0))
-            gap = max(2.0, (outer - inner) - 1.5)
-            outer = inner + gap
-            return Intent(
-                action="modify",
-                template="ring",
-                params={"height_mm": height, "outer_diameter_mm": outer},
-                reply="Making the band thinner.",
-            )
-        height = max(5.0, float(current_params.get("height_mm", 20.0)) * 0.75)
-        return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params={"height_mm": height},
-            reply="Making it thinner.",
-        )
-
-    # Inner diameter N mm
-    m = re.search(
-        r"inner\s+(?:diameter|hole)?\s*(?:to\s*)?(\d+(?:\.\d+)?)\s*(mm|millimeters?)?",
-        t,
-    )
-    if current_template == "ring" and m:
-        return Intent(
-            action="modify",
-            template="ring",
-            params={"inner_diameter_mm": float(m.group(1))},
-            reply=f"Setting inner diameter to {m.group(1)} millimeters.",
-        )
-
-    # taller / shorter
-    if current_template and ("taller" in t or "higher" in t):
-        height = float(current_params.get("height_mm", 20.0)) * 1.35
-        return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params={"height_mm": height},
-            reply="Making it taller.",
-        )
-    if current_template and ("shorter" in t or "lower" in t):
-        height = max(3.0, float(current_params.get("height_mm", 20.0)) * 0.7)
-        return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params={"height_mm": height},
-            reply="Making it shorter.",
-        )
-
-    # Generic scale
-    if current_template and ("bigger" in t or "larger" in t or "scale up" in t):
-        params = {
-            k: float(v) * 1.25
-            for k, v in current_params.items()
-            if isinstance(v, (int, float)) and k.endswith("_mm")
-        }
-        return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params=params,
-            reply="Making it bigger.",
-        )
-
-    if current_template and ("smaller" in t or "scale down" in t):
-        params = {
-            k: float(v) * 0.8
-            for k, v in current_params.items()
-            if isinstance(v, (int, float)) and k.endswith("_mm")
-        }
-        return Intent(
-            action="modify",
-            template=current_template,  # type: ignore[arg-type]
-            params=params,
-            reply="Making it smaller.",
-        )
-
-    return Intent(
-        action="clarify",
-        reply=(
-            "Try: build me a ring, box, or cylinder. "
-            "Then: make it yellow, make it bigger, or make the band thicker."
-        ),
-    )
+    return None
 
 
-async def _intent_from_gemini(
+def _scale_dimensions_in_script(script: str, scale: float, direction: str) -> str:
+    """Scale numeric dimensions in a CadQuery script."""
+    def scale_number(match):
+        num = float(match.group(0))
+        if num > 0.5:
+            return str(round(num * scale, 2))
+        return match.group(0)
+    
+    lines = script.split('\n')
+    modified_lines = []
+    for line in lines:
+        if 'import' in line or line.strip().startswith('#'):
+            modified_lines.append(line)
+        else:
+            modified_lines.append(re.sub(r'\b\d+\.?\d*\b', scale_number, line))
+    
+    return '\n'.join(modified_lines)
+
+
+def _parse_json_response(raw: str) -> dict:
+    """Parse JSON from LLM response, handling markdown fences."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
+async def _gemini_codegen(
     text: str,
-    cleaned: str,
     settings: Settings,
-    current_template: str | None,
-    current_params: dict[str, Any],
+    current_script: str | None = None,
+    last_error: str | None = None,
 ) -> Intent:
+    """Generate CadQuery code via Gemini API."""
     import httpx
 
-    user = {
-        "utterance": text,
-        "normalized": cleaned,
-        "current_template": current_template,
-        "current_params": current_params,
-    }
     model = settings.gemini_model
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent"
-    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    if last_error and current_script:
+        user_content = REPAIR_PROMPT.format(error=last_error, script=current_script)
+    else:
+        context = {"utterance": text}
+        if current_script:
+            context["current_script"] = current_script
+        user_content = json.dumps(context)
+
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": json.dumps(user)}],
-            }
-        ],
+        "system_instruction": {"parts": [{"text": CODEGEN_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
         "generationConfig": {
-            "temperature": 0,
+            "temperature": 0.2,
             "responseMimeType": "application/json",
         },
     }
-    async with httpx.AsyncClient(timeout=45.0) as client:
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             url,
             params={"key": settings.gemini_api_key},
@@ -318,59 +344,73 @@ async def _intent_from_gemini(
         )
         resp.raise_for_status()
         data = resp.json()
+
     raw = (
         data.get("candidates", [{}])[0]
         .get("content", {})
         .get("parts", [{}])[0]
         .get("text", "{}")
     )
-    # Strip markdown fences if model wraps JSON anyway
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    parsed = json.loads(raw)
-    intent = Intent.model_validate(parsed)
-    if intent.action == "clarify":
-        fallback = _rule_based_intent(cleaned, current_template, current_params)
-        if fallback.action != "clarify":
-            return fallback
-    return intent
+    parsed = _parse_json_response(raw)
+    return Intent.model_validate(parsed)
 
 
-async def _intent_from_openai(
+async def _openai_codegen(
     text: str,
-    cleaned: str,
     settings: Settings,
-    current_template: str | None,
-    current_params: dict[str, Any],
+    current_script: str | None = None,
+    last_error: str | None = None,
 ) -> Intent:
+    """Generate CadQuery code via OpenAI API."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    user = {
-        "utterance": text,
-        "normalized": cleaned,
-        "current_template": current_template,
-        "current_params": current_params,
-    }
+
+    if last_error and current_script:
+        user_content = REPAIR_PROMPT.format(error=last_error, script=current_script)
+    else:
+        context = {"utterance": text}
+        if current_script:
+            context["current_script"] = current_script
+        user_content = json.dumps(context)
+
     resp = await client.chat.completions.create(
         model=settings.openai_model,
-        temperature=0,
+        temperature=0.2,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(user)},
+            {"role": "system", "content": CODEGEN_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
         ],
     )
     raw = resp.choices[0].message.content or "{}"
-    data = json.loads(raw)
-    intent = Intent.model_validate(data)
-    if intent.action == "clarify":
-        fallback = _rule_based_intent(cleaned, current_template, current_params)
-        if fallback.action != "clarify":
-            return fallback
-    return intent
+    parsed = json.loads(raw)
+    return Intent.model_validate(parsed)
+
+
+async def generate_code(
+    text: str,
+    settings: Settings,
+    current_script: str | None = None,
+    last_error: str | None = None,
+) -> Intent:
+    """Generate CadQuery code from natural language using LLM."""
+    if settings.gemini_api_key:
+        try:
+            return await _gemini_codegen(text, settings, current_script, last_error)
+        except Exception as exc:
+            logger.warning("Gemini codegen failed (%s); trying OpenAI", exc)
+
+    if settings.openai_api_key:
+        try:
+            return await _openai_codegen(text, settings, current_script, last_error)
+        except Exception as exc:
+            logger.warning("OpenAI codegen failed (%s)", exc)
+
+    return Intent(
+        action="clarify",
+        reply="Code generation unavailable. Please configure GEMINI_API_KEY or OPENAI_API_KEY.",
+    )
 
 
 async def parse_intent(
@@ -378,30 +418,63 @@ async def parse_intent(
     settings: Settings,
     current_template: str | None,
     current_params: dict[str, Any],
+    current_script: str | None = None,
 ) -> tuple[Intent, float]:
+    """
+    Parse user utterance into Intent with CadQuery script.
+    
+    Flow:
+    1. Normalize STT errors
+    2. Fast path: pure color changes
+    3. Fast path: scale/size modifications (if script exists)
+    4. LLM codegen: generate CadQuery Python for any shape
+    
+    Returns (Intent, latency_ms).
+    """
     t0 = time.perf_counter()
     cleaned = _normalize_transcript(text)
+    logger.info("Intent parsing: %r", cleaned)
 
-    # Prefer Gemini (free-tier), then OpenAI, then rules
-    if settings.gemini_api_key:
-        try:
-            intent = await _intent_from_gemini(
-                text, cleaned, settings, current_template, current_params
-            )
-            logger.info("Intent via Gemini: %s", intent.action)
-            return intent, (time.perf_counter() - t0) * 1000
-        except Exception as exc:
-            logger.warning("Gemini intent failed (%s); trying fallback", exc)
+    color_intent = _check_color_only(cleaned)
+    if color_intent:
+        logger.info("Fast path: color change → %s", color_intent.params.get("color"))
+        return color_intent, (time.perf_counter() - t0) * 1000
 
-    if settings.openai_api_key:
-        try:
-            intent = await _intent_from_openai(
-                text, cleaned, settings, current_template, current_params
-            )
-            logger.info("Intent via OpenAI: %s", intent.action)
-            return intent, (time.perf_counter() - t0) * 1000
-        except Exception as exc:
-            logger.warning("OpenAI intent failed (%s); using rules", exc)
+    scale_intent = _check_scale_modify(cleaned, current_script)
+    if scale_intent:
+        logger.info("Fast path: scale modification")
+        return scale_intent, (time.perf_counter() - t0) * 1000
 
-    intent = _rule_based_intent(cleaned, current_template, current_params)
+    intent = await generate_code(cleaned, settings, current_script)
+    logger.info("LLM codegen → action=%s", intent.action)
     return intent, (time.perf_counter() - t0) * 1000
+
+
+async def repair_and_retry(
+    original_text: str,
+    failed_script: str,
+    error: str,
+    settings: Settings,
+    max_retries: int = 2,
+) -> Intent:
+    """
+    Attempt to repair a failed CadQuery script.
+    
+    Feeds the error back to the LLM and asks for a fix.
+    """
+    for attempt in range(max_retries):
+        logger.info("Repair attempt %d/%d for error: %s", attempt + 1, max_retries, error[:100])
+        intent = await generate_code(
+            original_text,
+            settings,
+            current_script=failed_script,
+            last_error=error,
+        )
+        if intent.action == "generate" and intent.script:
+            return intent
+        failed_script = intent.script or failed_script
+
+    return Intent(
+        action="clarify",
+        reply=f"I couldn't generate working code after {max_retries} attempts. Error: {error}",
+    )
