@@ -27,7 +27,13 @@ export class PercyAssistant {
     if (this.started) return;
 
     try {
-      this.wakeDetector = new WakeWordDetector(() => this._onWakeWord());
+      this.wakeDetector = new WakeWordDetector(
+        () => this._onWakeWord(),
+        {
+          onTentative: (score) => this._onWakeTentative(score),
+          onMiss: () => this._onWakeMiss(),
+        }
+      );
       await this.wakeDetector.start();
       this.started = true;
       voiceState.toIdle();
@@ -37,6 +43,29 @@ export class PercyAssistant {
       voiceState.toError("Microphone access required");
       this.onStatusMessage("Mic access required. Allow and refresh.", false);
     }
+  }
+
+  _onWakeTentative(score) {
+    if (voiceState.isMuted || !voiceState.isIdle) return;
+    voiceState.toWakeTentative();
+    this.onStatusMessage("Listening...", true);
+    setTimeout(() => {
+      if (voiceState.isWakeTentative) {
+        voiceState.toIdle();
+      }
+    }, 600);
+  }
+
+  _onWakeMiss() {
+    if (voiceState.isMuted) return;
+    voiceState.toWakeMiss();
+    this.onStatusMessage("Didn't quite catch that — say 'Percy' again", true);
+    setTimeout(() => {
+      if (voiceState.isWakeMiss) {
+        voiceState.toIdle();
+        this.onStatusMessage("Percy ready. Say 'Percy' to activate.", true);
+      }
+    }, 1200);
   }
 
   stop() {

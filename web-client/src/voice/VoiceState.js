@@ -1,9 +1,12 @@
 /**
  * VoiceState - State machine for Percy voice assistant
- * States: idle | listening | thinking | speaking | error | muted
+ * States: idle | listening | thinking | speaking | error | muted | wake_tentative | wake_miss
  *
  * Idle = local KWS only (no STT/Gemini/ElevenLabs calls)
  * On wake → VAD listen window → STT/API handoff → back to idle
+ *
+ * wake_tentative = Wake word detection near threshold (amber pulse)
+ * wake_miss = Wake word attempt failed / retrying (brief flash)
  */
 
 export const VoiceStates = Object.freeze({
@@ -13,6 +16,8 @@ export const VoiceStates = Object.freeze({
   SPEAKING: "speaking",
   ERROR: "error",
   MUTED: "muted",
+  WAKE_TENTATIVE: "wake_tentative",
+  WAKE_MISS: "wake_miss",
 });
 
 export class VoiceStateManager {
@@ -97,6 +102,26 @@ export class VoiceStateManager {
 
   toError(message) {
     this.setState(VoiceStates.ERROR, message);
+  }
+
+  toWakeTentative() {
+    if (!this._muted && this._state === VoiceStates.IDLE) {
+      this.setState(VoiceStates.WAKE_TENTATIVE);
+    }
+  }
+
+  toWakeMiss() {
+    if (!this._muted) {
+      this.setState(VoiceStates.WAKE_MISS);
+    }
+  }
+
+  get isWakeTentative() {
+    return this._state === VoiceStates.WAKE_TENTATIVE;
+  }
+
+  get isWakeMiss() {
+    return this._state === VoiceStates.WAKE_MISS;
   }
 
   subscribe(callback) {

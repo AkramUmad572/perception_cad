@@ -9,12 +9,17 @@
 
 const FRAME_SIZE = 1280; // 80ms at 16kHz - matches OpenWakeWord expected input
 const SAMPLE_RATE = 16000;
-const DETECTION_THRESHOLD = 0.35; // Lowered from 0.5 for better sensitivity
-const COOLDOWN_MS = 1200; // Reduced from 1500 to allow faster re-triggers
+const DETECTION_THRESHOLD = 0.35; // Lowered from 0.5 for better sensitivity (Tabish)
+const TENTATIVE_THRESHOLD = 0.25; // Near-miss threshold for "almost heard Percy"
+const COOLDOWN_MS = 1200; // Reduced from 1500 to allow faster re-triggers (Tabish)
+const TENTATIVE_COOLDOWN_MS = 400; // Shorter cooldown for tentative signals
+const RETRY_WINDOW_MS = 2000; // Window to accumulate near-misses before retry signal
 
 export class WakeWordDetector {
-  constructor(onWakeWord) {
+  constructor(onWakeWord, options = {}) {
     this.onWakeWord = onWakeWord;
+    this.onTentative = options.onTentative || null;
+    this.onMiss = options.onMiss || null;
     this.audioContext = null;
     this.analyser = null;
     this.source = null;
@@ -22,6 +27,9 @@ export class WakeWordDetector {
     this.session = null;
     this.running = false;
     this.lastDetection = 0;
+    this.lastTentative = 0;
+    this.tentativeCount = 0;
+    this.tentativeWindowStart = 0;
     this._audioBuffer = new Float32Array(0);
     this._useFallback = false;
   }
@@ -150,14 +158,41 @@ export class WakeWordDetector {
     if (now - this.lastDetection < COOLDOWN_MS) return;
 
     try {
-      const detected = this._useFallback
+      const result = this._useFallback
         ? await this._detectFallback(frame)
         : await this._detectOnnx(frame);
 
-      if (detected) {
+      if (result.detected) {
         this.lastDetection = now;
+        this.tentativeCount = 0;
+        this.tentativeWindowStart = 0;
         console.log("[Percy] Wake word detected!");
         this.onWakeWord?.();
+      } else if (result.tentative) {
+        if (now - this.lastTentative > TENTATIVE_COOLDOWN_MS) {
+          this.lastTentative = now;
+          
+          if (this.tentativeWindowStart === 0) {
+            this.tentativeWindowStart = now;
+          }
+          
+          if (now - this.tentativeWindowStart < RETRY_WINDOW_MS) {
+            this.tentativeCount++;
+            console.log(`[Percy] Wake word tentative (score: ${result.score?.toFixed(3)}, count: ${this.tentativeCount})`);
+            this.onTentative?.(result.score);
+            
+            if (this.tentativeCount >= 3) {
+              console.log("[Percy] Multiple near-misses detected, signaling retry");
+              this.onMiss?.();
+              this.tentativeCount = 0;
+              this.tentativeWindowStart = 0;
+            }
+          } else {
+            this.tentativeCount = 1;
+            this.tentativeWindowStart = now;
+            this.onTentative?.(result.score);
+          }
+        }
       }
     } catch (e) {
       console.error("[Percy] Detection error:", e);
@@ -165,21 +200,28 @@ export class WakeWordDetector {
   }
 
   async _detectOnnx(frame) {
-    if (!this.session) return false;
+    if (!this.session) return { detected: false, tentative: false, score: 0 };
 
     const tensor = new window.ort.Tensor("float32", frame, [1, FRAME_SIZE]);
     const results = await this.session.run({ input: tensor });
     const output = results.output?.data || results[Object.keys(results)[0]]?.data;
 
-    if (!output) return false;
+    if (!output) return { detected: false, tentative: false, score: 0 };
     const score = output[0];
-    return score > DETECTION_THRESHOLD;
+    
+    return {
+      detected: score > DETECTION_THRESHOLD,
+      tentative: score > TENTATIVE_THRESHOLD && score <= DETECTION_THRESHOLD,
+      score,
+    };
   }
 
   async _detectFallback(frame) {
     const sum = frame.reduce((a, b) => a + Math.abs(b), 0);
     const avg = sum / frame.length;
-    return avg > 0.10; // Lowered from 0.15 for better fallback sensitivity
+    const detected = avg > 0.10; // Lowered from 0.15 for better fallback sensitivity (Tabish)
+    const tentative = avg > 0.07 && avg <= 0.10;
+    return { detected, tentative, score: avg };
   }
 
   stop() {
