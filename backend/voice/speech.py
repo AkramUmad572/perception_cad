@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 PERCY_ALIASES = re.compile(
-    r"^\s*(?:i\s+see|pursee|persey|piercy|mercy|merci|percy|perce|purse|see|pc)[,.\s]*",
+    # Optional leftover wake names — not "see" / "i see" (real commands can start that way).
+    r"^\s*(?:pursee|persey|piercy|mercy|merci|percy|perce|purse|pc)[,.\s]*",
     re.IGNORECASE,
 )
 
@@ -35,8 +36,9 @@ def normalize_wake_word(transcript: str) -> str:
     'Hey Percy' variants (canonical wake phrase):
       hey mercy, hey see, hey merce, hey pursey, a mercy → hey percy
     
-    Legacy single-word aliases (still supported):
-      Mercy, Merci, See, I see, PC, purse, perce, persey, piercy → Percy
+    Legacy leftover wake names (still stripped if STT prefixes them):
+      Mercy, Merci, PC, purse, perce, persey, piercy → Percy
+    Bare "see" / "I see" are left alone so they are not treated as a wake word.
     """
     match = HEY_PERCY_ALIASES.match(transcript)
     if match:
@@ -108,26 +110,22 @@ async def _elevenlabs_stt(
             # Try with keyterms, then without if rejected
             for with_keyterms in (True, False):
                 try:
-                    files = {"file": (name, audio_bytes, mime)}
-                    data: dict[str, str] | list[tuple[str, str]]
+                    # Put fields in `files` (not `data`) so AsyncClient does not
+                    # try a sync multipart encode (httpx: "sync request with AsyncClient").
+                    files: list[tuple[str, tuple]] = [
+                        ("file", (name, audio_bytes, mime)),
+                        ("model_id", (None, model_id)),
+                        ("language_code", (None, "eng")),
+                        ("tag_audio_events", (None, "false")),
+                    ]
                     if with_keyterms:
-                        data = [
-                            ("model_id", model_id),
-                            ("language_code", "eng"),
-                            ("tag_audio_events", "false"),
-                        ] + [("keyterms", t) for t in CAD_KEYTERMS]
-                    else:
-                        data = {
-                            "model_id": model_id,
-                            "language_code": "eng",
-                            "tag_audio_events": "false",
-                        }
+                        for term in CAD_KEYTERMS:
+                            files.append(("keyterms", (None, term)))
 
                     resp = await client.post(
                         "https://api.elevenlabs.io/v1/speech-to-text",
                         headers={"xi-api-key": settings.elevenlabs_api_key},
                         files=files,
-                        data=data,
                     )
                     if resp.status_code == 422 and with_keyterms:
                         logger.info("Scribe rejected keyterms; retrying plain")

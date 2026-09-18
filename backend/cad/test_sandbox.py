@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cad.sandbox import execute_cadquery_script
+from cad.sandbox import _hex_to_rgb, execute_cadquery_script
 
 
 # Scripts that SHOULD succeed
@@ -55,6 +55,14 @@ import cadquery as cq
 box = cq.Workplane("XY").box(30, 30, 30)
 cylinder = cq.Workplane("XY").cylinder(40, 10)
 result = box.cut(cylinder)
+''',
+
+    "character_union": '''
+import cadquery as cq
+head = cq.Workplane("XY").sphere(18)
+ear_l = cq.Workplane("XY").transformed(offset=(-12, 16, 8)).sphere(8)
+ear_r = cq.Workplane("XY").transformed(offset=(12, 16, 8)).sphere(8)
+result = head.union(ear_l).union(ear_r)
 ''',
     
     "with_math": '''
@@ -177,6 +185,99 @@ def test_builtin_blocked():
     return passed, failed
 
 
+def test_hex_to_rgb():
+    """Vertex-color bake helper: valid hex including black; invalid → silver."""
+    print("\n=== Testing hex color bake helper ===")
+    passed = 0
+    failed = 0
+    cases = [
+        ("#FFD700", (255, 215, 0), "gold"),
+        ("#000000", (0, 0, 0), "intentional black"),
+        ("#212121", (33, 33, 33), "near-black"),
+        ("#fff", (255, 255, 255), "short white"),
+        ("#C0C0C0", (192, 192, 192), "silver"),
+        ("not-a-color", (192, 192, 192), "invalid → silver"),
+        (None, (192, 192, 192), "None → silver"),
+        ("", (192, 192, 192), "empty → silver"),
+    ]
+    for raw, expected, description in cases:
+        got = _hex_to_rgb(raw)
+        if got == expected:
+            print(f"  [ok] {description}: {raw!r} → {got}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {description}: {raw!r}")
+            print(f"    Expected: {expected}")
+            print(f"    Got:      {got}")
+            failed += 1
+    return passed, failed
+
+
+def test_assembly_part_colors():
+    """Assembly children keep distinct vertex colors unless flatten_color=True."""
+    print("\n=== Testing Assembly per-part colors ===")
+    import numpy as np
+    import trimesh
+    import tempfile
+
+    script = '''
+import cadquery as cq
+gold = cq.Workplane("XY").sphere(8)
+blk = cq.Workplane("XY").transformed(offset=(16, 0, 0)).sphere(6)
+assy = cq.Assembly()
+assy.add(gold, name="gold", color=cq.Color("#FFD700"))
+assy.add(blk, name="black", color=cq.Color("#212121"))
+result = assy
+'''
+    passed = 0
+    failed = 0
+    out = Path(tempfile.mkdtemp())
+
+    def unique_colors(glb_path):
+        loaded = trimesh.load(str(glb_path))
+        geoms = list(loaded.geometry.values()) if isinstance(loaded, trimesh.Scene) else [loaded]
+        seen = set()
+        for g in geoms:
+            vc = np.asarray(g.visual.vertex_colors)
+            if vc.size == 0:
+                continue
+            row = tuple(int(x) for x in np.mean(vc.reshape(-1, vc.shape[-1]), axis=0)[:3])
+            seen.add(row)
+        return seen
+
+    keep = execute_cadquery_script(
+        script, output_dir=out, flatten_color=False, color="#00FF00"
+    )
+    if keep.get("ok") and keep.get("multi_color"):
+        cols = unique_colors(keep["glb_path"])
+        if len(cols) >= 2:
+            print(f"  [ok] flatten_color=False keeps {len(cols)} part colors {cols}")
+            passed += 1
+        else:
+            print(f"  [FAIL] expected 2+ colors, got {cols}")
+            failed += 1
+    else:
+        print(f"  [FAIL] assembly export: {keep}")
+        failed += 1
+
+    flat = execute_cadquery_script(
+        script, output_dir=out, flatten_color=True, color="#E53935"
+    )
+    if flat.get("ok"):
+        cols = unique_colors(flat["glb_path"])
+        if len(cols) == 1 and list(cols)[0][:3] == (229, 57, 53):
+            print("  [ok] flatten_color=True paints all parts #E53935")
+            passed += 1
+        else:
+            print(f"  [FAIL] flatten expected single (229,57,53), got {cols}")
+            failed += 1
+    else:
+        print(f"  [FAIL] flatten export: {flat}")
+        failed += 1
+
+    return passed, failed
+
+
 def run_all_tests():
     """Run all sandbox tests."""
     print("=" * 60)
@@ -186,9 +287,11 @@ def run_all_tests():
     v_pass, v_fail = test_valid_scripts()
     s_pass, s_fail = test_security_blocked()
     b_pass, b_fail = test_builtin_blocked()
+    h_pass, h_fail = test_hex_to_rgb()
+    a_pass, a_fail = test_assembly_part_colors()
     
-    total_pass = v_pass + s_pass + b_pass
-    total_fail = v_fail + s_fail + b_fail
+    total_pass = v_pass + s_pass + b_pass + h_pass + a_pass
+    total_fail = v_fail + s_fail + b_fail + h_fail + a_fail
     
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -196,6 +299,8 @@ def run_all_tests():
     print(f"Valid scripts:     {v_pass}/{v_pass + v_fail} passed")
     print(f"Security blocking: {s_pass}/{s_pass + s_fail} passed")
     print(f"Builtin blocking:  {b_pass}/{b_pass + b_fail} passed")
+    print(f"Hex color bake:    {h_pass}/{h_pass + h_fail} passed")
+    print(f"Assembly colors:   {a_pass}/{a_pass + a_fail} passed")
     print(f"TOTAL:             {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

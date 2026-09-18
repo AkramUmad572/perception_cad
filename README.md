@@ -2,16 +2,17 @@
 
 Voice-driven CAD on **Meta Quest 3** via **WebXR passthrough AR** (Quest Browser) + **CadQuery**.
 
-Say **"Percy"** → speak your command → model floats in your **real room** → pinch to move/spin.
+Say a command while **holding** left trigger / pinch → model floats in your **real room** → right-pinch to move/spin.
 
 ## Stack
 
 | Piece | Tech |
 |---|---|
 | Headset UI | Three.js WebXR **immersive-ar** passthrough |
-| CAD | CadQuery (conda) with sandboxed execution |
+| CAD | CadQuery sandbox (dimensional / printable parts) |
+| Mesh | three.ws / NVIDIA TRELLIS (free) or Meshy (optional paid) |
 | API | FastAPI |
-| Voice | Percy wake word + VAD + ElevenLabs STT/TTS |
+| Voice | Hold-to-talk (left trigger / pinch) + ElevenLabs STT/TTS |
 
 ## Quest Testing
 
@@ -28,7 +29,7 @@ Say **"Percy"** → speak your command → model floats in your **real room** �
 ```bash
 conda activate perception_cad
 cd backend
-cp .env.example .env  # Edit with your API keys
+cp .env.example .env  # GEMINI_API_KEY, ELEVENLABS_API_KEY, MESHY_API_KEY
 PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -48,36 +49,41 @@ npm run dev:https
 
 5. **Tap "Enter AR"** to start passthrough mode
 
-6. **Test Percy**:
-   - Say **"Percy"** (wake word) - status should change to "Listening..."
-   - Give a command: "build me a ring", "make it yellow", "bigger"
+6. **Talk**:
+   - Hold **left trigger** or **left pinch** (anywhere — not on the model) and speak
+   - Release to send. Try: "build me a ring", "make it yellow", "bigger"
    - Model appears in front of you
-   - Pinch near the model to grab/move/spin
+   - **Right** pinch near the model to grab/move/spin
 
 ### Voice Commands
 
-| Say | Result |
+Free-rein: describe any object. CadQuery for dimensional/printable parts; Meshy for characters and organic models.
+
+| Say (while holding to talk) | Result |
 |---|---|
-| "Percy, build me a ring" | Creates a ring |
-| "Percy, make it yellow" | Changes color |
-| "Percy, bigger" / "smaller" | Scales the model |
-| "Percy, thicker" / "thinner" | Adjusts dimensions |
-| "Percy, build a box" | Creates a box |
-| "Percy, cylinder" | Creates a cylinder |
+| "build me a Pikachu keychain" | CadQuery charm + lug hole |
+| "make me a Pikachu" | Meshy sculpted character |
+| "build me a 12 tooth gear" | CadQuery |
+| "make me a toy car" | Meshy |
+| "make the ears longer" | Gemini edits the current CAD script |
+| "add a hole for a keychain" | Same CAD object, extra feature |
+| "make it twice as big" | CAD: scales dimensions. Mesh: re-sculpts |
+| "make it navy" / "paint it gold" | Recolor + rebuild |
+| "change the color" | Percy asks which color |
 
 ### Controls
 
-- **Voice**: Say "Percy" to activate, then speak command
-- **Mute**: Press **M** key (desktop) to toggle Percy on/off
-- **Grab**: Pinch near the model (hand tracking) or controller select
-- **Move/Spin**: While grabbing, move hand to reposition
+- **Talk**: Hold left trigger, left pinch, overlay **Hold** button, or **Space**. Release to send.
+- **Mute**: Press **M** (desktop)
+- **Grab**: Right pinch near the model, or right controller trigger near the model
+- **Move/Spin**: While grabbing, move the right hand
 
 ### Troubleshooting
 
 | Issue | Fix |
 |---|---|
 | "API offline" | Check backend is running on port 8000 |
-| No wake word | Check mic permissions, try refreshing |
+| Nothing happens on hold | Allow microphone; hold longer than a tap |
 | Model not appearing | Look forward after entering AR |
 | Certificate error | Accept self-signed cert in Quest Browser |
 | Mic blocked | Quest Settings → Apps → Browser → Permissions |
@@ -88,7 +94,7 @@ npm run dev:https
 cd web-client && npm run dev
 ```
 
-Open **http://localhost:5173**. Percy works on desktop too (say "Percy" or press M to mute).
+Open **https://localhost:5173** (IWSDK emulator window). Hold **Space** or the **Hold** button to talk. Right-controller trigger near the model to grab.
 
 ## API Endpoints
 
@@ -125,7 +131,8 @@ Scripts run in a sandbox with:
 backend/
   app/           FastAPI routes + pipeline
   cad/           CadQuery builder + sandbox
-  ai/            Intent parsing (Gemini/OpenAI)
+  mesh/          Text-to-3D factories (three.ws, NVIDIA, Meshy)
+  ai/            Intent parsing + cad/mesh router
   voice/         STT/TTS (ElevenLabs)
 
 web-client/
@@ -133,8 +140,7 @@ web-client/
     main.js      WebXR scene + model interaction
     voice/
       VoiceState.js       State machine (idle|listening|thinking|speaking|error|muted)
-      WakeWordDetector.js  OpenWakeWord "Percy" ONNX
-      VADListener.js       Voice activity detection
+      PTTRecorder.js      Hold-to-talk MediaRecorder
       PercyAssistant.js    Orchestrator
 ```
 

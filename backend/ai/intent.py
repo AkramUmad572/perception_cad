@@ -10,206 +10,142 @@ from typing import Any
 
 from app.config import Settings
 from app.models import Intent
+from photos.search import is_photo_search, photo_query
 
 logger = logging.getLogger(__name__)
 
-CODEGEN_SYSTEM_PROMPT = """You are a CadQuery Python code generator for a voice-controlled CAD system.
+CODEGEN_SYSTEM_PROMPT = """You are a CadQuery Python generator for a voice-driven CAD app.
 
-When the user describes ANY 3D shape or object, you generate working CadQuery Python code.
-You can make ANYTHING the user asks for — there are no restrictions on shape types.
+Free-rein: ANY object. No shape whitelist. Prefer TOO MANY named parts over one lump.
 
-## Output Format
-Return ONLY valid JSON:
-{
-  "action": "generate",
-  "script": "import cadquery as cq\\nresult = ...",
-  "reply": "Building a [description]."
-}
+## Output (JSON only)
+Always include "backend":"cad" or "backend":"mesh".
 
-Or for non-CAD requests:
-{
-  "action": "set_material",
-  "params": {"color": "#HEXCODE"},
-  "reply": "Changed the color."
-}
+CAD geometry (list parts FIRST, then the script):
+{"action":"generate","backend":"cad","parts":[{"name":"head","color":"#FFD700"}],"size_mm":60,"script":"import cadquery as cq\\n...\\nresult = assy","reply":"Short spoken confirmation."}
 
-Or if you need clarification:
-{
-  "action": "clarify",
-  "reply": "Could you describe what shape you'd like?"
-}
+Mesh / sculpted model (NO CadQuery script):
+{"action":"generate","backend":"mesh","mesh_prompt":"short visual English for a 3D model","size_mm":200,"script":null,"reply":"Sculpting that."}
 
-## Script Requirements
-1. Script MUST start with `import cadquery as cq`
-2. Script MUST define `result` variable with the final CadQuery workplane/solid
-3. Use millimeters for all dimensions
-4. Default to reasonable sizes (10-50mm) unless user specifies
-5. Code must be syntactically valid Python
+Whole-object color only (no part named):
+{"action":"set_material","backend":"cad","params":{"color":"#HEXCODE"},"reply":"Changed the color."}
 
-## SANDBOX SECURITY RULES — CRITICAL
-Scripts run in a restricted sandbox. ONLY use the patterns below or the script will fail.
+Need a missing fact:
+{"action":"clarify","reply":"What color?"}
 
-### ALLOWED operations:
-- Import: `import cadquery as cq` and `import math` ONLY
-- Entry point: `cq.Workplane("XY")` / `cq.Workplane("XZ")` / `cq.Workplane("YZ")`
-- 2D sketching: .circle(), .rect(), .polygon(), .polyline(), .close(), .text()
-- 3D operations: .box(), .cylinder(), .sphere(), .extrude(), .loft(), .revolve()
-- Subtractive: .cut(), .hole()
-- Edge/face ops: .fillet(), .chamfer(), .edges(), .faces(), .workplane()
-- Boolean: .union(), .cut(), .intersect() via Workplane methods
-- Selectors: .faces(">Z"), .edges("|Z"), etc. for selecting geometry
-- Variables: plain Python variables for dimensions, lists for polyline points
-- Math: math.pi, math.sin, math.cos, math.sqrt, etc.
-- Loops: for/while for generating point lists
+## Backend (pick first; do not guess against these)
+CAD if ANY is true: hole, mm, fillet, gear, mug, vase, stand, plate, hinge, printable, 3D print, keychain/keyring, axle, follow-up on a CAD script, or the user asked for a printable/dimensional part — even on a character ("Pikachu keychain", "car with a 4mm axle").
+MESH if: creature, character, animal, person, "looks like X", "a model of X", or a toy car / a car with no hole/print. "make me a Pikachu" = mesh. "make me a toy car" = mesh.
+Existing CAD + "now a dragon" = mesh (new organic object). Mesh session tweaks ("cuter", "more yellow") stay mesh. Do not emit a CadQuery script for mesh.
 
-### FORBIDDEN — will trigger SECURITY error:
-- getattr, setattr, delattr, hasattr
-- type(), object, vars(), dir(), globals(), locals()
-- __import__, importlib, exec, eval, compile
-- open(), file operations, pathlib, os, sys
-- Network: socket, urllib, requests, http
-- Any module not in [math, cadquery]
-- Accessing cq internals: cq.occ_impl, cq.selectors internals, __class__, __bases__
-- Dynamic attribute access or introspection tricks
+## Richness (required)
+- Invent the canonical part breakdown. Not a phrasebook.
+  Character: head, body, ear bases, ear tips, eyes, cheeks, limbs/tail as relevant.
+  Vehicle: body, cabin, windows/greenhouse, bumper, 4 wheels, hubs, headlights.
+  Keychain: charm parts + lug + 3-4mm hole.
+- 8-15 parts for characters/vehicles/keychains. 4+ for a simple mug.
+- Characteristic details are mandatory (keychain hole, four distinct wheels, ear tips + cheeks on a Pikachu-class creature).
+- Default overall size ~50-90mm. Keychains may be flatter (~6-8mm thick).
 
-## CadQuery Examples (sandbox-safe patterns only)
+## Assembly
+More than one part → `result` MUST be `cq.Assembly()`, never a single .union() of everything.
+assy.add(solid, name="wheels", color=cq.Color("#212121"))
+Use matching names in the parts[] array.
 
-Simple box:
+## CadQuery 2 API
+- import cadquery as cq (and math if needed). Valid Python only. Millimeters.
+- .extrude(height) ONLY — never extrude(..., centered=...). .box(l,w,h) may use centered=.
+- NO .cone() (does not exist). Tapered solids: loft two circles at an offset.
+- OK: Workplane XY/XZ/YZ, Sketch, circle/rect/polygon/polyline/close/text, box/cylinder/sphere, extrude/loft/revolve/sweep, cut/hole/union/intersect, fillet/chamfer, transformed/offset, edges/faces/workplane/center, shell, Assembly, Color, Location, Vector.
+- FORBIDDEN: getattr/setattr/type/object/exec/eval/open/os/sys/network/importlib/pathlib/cq.occ_impl.
+
+## Follow-ups
+User JSON may include current_script, last_summary, current_color.
+- Same object: EDIT the Assembly. Keep parts. Change dimensions/colors. NEVER scale loop counts, n_teeth, or range().
+- Different object: new script + new parts list.
+- "make the ears black" / "wheels black": EDIT those parts' cq.Color, action=generate.
+- "make it yellow" with no part name: set_material.
+
+## Examples
+Character (lofted ears, colored tips) — pattern for any creature:
 ```python
 import cadquery as cq
-result = cq.Workplane("XY").box(30, 20, 10)
+def loft_ear(x, y, z, r0, r1, h):
+    return (cq.Workplane("XY").transformed(offset=(x, y, z))
+            .circle(r0).workplane(offset=h).circle(r1).loft())
+head = cq.Workplane("XY").sphere(16)
+body = cq.Workplane("XY").transformed(offset=(0, -18, 0)).sphere(14)
+ear_l = loft_ear(-10, 12, 6, 5.5, 1.6, 16)
+ear_r = loft_ear(10, 12, 6, 5.5, 1.6, 16)
+tip_l = loft_ear(-10, 12, 20, 2.0, 0.7, 7)
+tip_r = loft_ear(10, 12, 20, 2.0, 0.7, 7)
+eye_l = cq.Workplane("XY").transformed(offset=(-5, 2, 13)).sphere(2.2)
+eye_r = cq.Workplane("XY").transformed(offset=(5, 2, 13)).sphere(2.2)
+cheek_l = cq.Workplane("XY").transformed(offset=(-10, -3, 11)).sphere(3.8)
+cheek_r = cq.Workplane("XY").transformed(offset=(10, -3, 11)).sphere(3.8)
+lug = (cq.Workplane("XY").transformed(offset=(0, 22, 4)).circle(4.5).extrude(3)
+       .faces(">Z").workplane().hole(3.2))
+assy = cq.Assembly()
+assy.add(head, name="head", color=cq.Color("#FFD700"))
+assy.add(body, name="body", color=cq.Color("#FFD700"))
+assy.add(ear_l, name="ear_l", color=cq.Color("#FFD700"))
+assy.add(ear_r, name="ear_r", color=cq.Color("#FFD700"))
+assy.add(tip_l, name="tip_l", color=cq.Color("#212121"))
+assy.add(tip_r, name="tip_r", color=cq.Color("#212121"))
+assy.add(eye_l, name="eye_l", color=cq.Color("#212121"))
+assy.add(eye_r, name="eye_r", color=cq.Color("#212121"))
+assy.add(cheek_l, name="cheek_l", color=cq.Color("#E53935"))
+assy.add(cheek_r, name="cheek_r", color=cq.Color("#E53935"))
+assy.add(lug, name="lug", color=cq.Color("#FFD700"))
+result = assy
 ```
 
-Cylinder:
+Keychain lug + hole:
 ```python
 import cadquery as cq
-result = cq.Workplane("XY").circle(15).extrude(40)
+plate = cq.Workplane("XY").box(46, 26, 6).edges("|Z").fillet(5)
+charm = plate.faces(">Z").workplane().center(-8, 0).text("Hi", 8, 1.2)
+lug = (cq.Workplane("XY").transformed(offset=(18, 0, 0)).circle(5).extrude(6)
+       .faces(">Z").workplane().hole(3.5))
+assy = cq.Assembly()
+assy.add(plate, name="plate", color=cq.Color("#FFD700"))
+assy.add(charm, name="text", color=cq.Color("#212121"))
+assy.add(lug, name="lug", color=cq.Color("#FFD700"))
+result = assy
 ```
 
-Sphere:
+Toy car (cabin, 4 wheels, headlights):
 ```python
 import cadquery as cq
-result = cq.Workplane("XY").sphere(20)
+body = cq.Workplane("XY").box(72, 30, 16)
+cabin = cq.Workplane("XY").transformed(offset=(-8, 0, 14)).box(30, 24, 14)
+bumper = cq.Workplane("XY").transformed(offset=(34, 0, -2)).box(8, 28, 8)
+def wheel(x, y):
+    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(7).extrude(6)
+def hub(x, y):
+    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(2.8).extrude(6.5)
+def lamp(x, y, z):
+    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(3)
+assy = cq.Assembly()
+assy.add(body, name="body", color=cq.Color("#E53935"))
+assy.add(cabin, name="cabin", color=cq.Color("#90CAF9"))
+assy.add(bumper, name="bumper", color=cq.Color("#C0C0C0"))
+assy.add(wheel(22, 16), name="wheel_fl", color=cq.Color("#212121"))
+assy.add(wheel(22, -16), name="wheel_fr", color=cq.Color("#212121"))
+assy.add(wheel(-22, 16), name="wheel_rl", color=cq.Color("#212121"))
+assy.add(wheel(-22, -16), name="wheel_rr", color=cq.Color("#212121"))
+assy.add(hub(22, 16), name="hub_fl", color=cq.Color("#C0C0C0"))
+assy.add(lamp(34, 8, 4), name="lamp_l", color=cq.Color("#FFF3E0"))
+assy.add(lamp(34, -8, 4), name="lamp_r", color=cq.Color("#FFF3E0"))
+result = assy
 ```
 
-Ring (hollow cylinder):
-```python
-import cadquery as cq
-outer_r, inner_r, height = 11, 9, 4
-result = cq.Workplane("XY").circle(outer_r).extrude(height).faces(">Z").workplane().hole(inner_r * 2)
-```
+## Color hex
+yellow/gold=#FFD700 red=#E53935 blue=#1E88E5 green=#43A047 silver/grey=#C0C0C0
+black=#212121 white=#FAFAFA orange=#FB8C00 purple=#8E24AA pink=#EC407A
+navy=#0D47A1 mint=#66BB6A cream=#FFF3E0 bronze=#CD7F32
 
-Cone (via loft):
-```python
-import cadquery as cq
-result = cq.Workplane("XY").circle(20).workplane(offset=30).circle(0.1).loft()
-```
-
-Pyramid (via loft):
-```python
-import cadquery as cq
-result = cq.Workplane("XY").rect(30, 30).workplane(offset=25).rect(1, 1).loft()
-```
-
-Hexagonal prism:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").polygon(6, 20).extrude(15)
-```
-
-Box with hole:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").box(30, 30, 20).faces(">Z").workplane().hole(10)
-```
-
-Rounded box (fillet all edges):
-```python
-import cadquery as cq
-result = cq.Workplane("XY").box(30, 20, 15).edges().fillet(3)
-```
-
-Chamfered box:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").box(25, 25, 12).edges().chamfer(2)
-```
-
-Keychain (plate + hole + fillet + text):
-```python
-import cadquery as cq
-plate = cq.Workplane("XY").box(50, 25, 4).edges("|Z").fillet(3)
-with_hole = plate.faces(">Z").workplane().center(20, 0).hole(5)
-result = with_hole.faces(">Z").workplane().center(-5, 0).text("KEY", 8, 1)
-```
-
-Star shape (using polyline with math):
-```python
-import cadquery as cq
-import math
-pts = []
-for i in range(10):
-    angle = i * math.pi / 5
-    r = 20 if i % 2 == 0 else 10
-    pts.append((r * math.cos(angle), r * math.sin(angle)))
-result = cq.Workplane("XY").polyline(pts).close().extrude(5)
-```
-
-Gear-like shape:
-```python
-import cadquery as cq
-import math
-n_teeth = 12
-outer_r, inner_r = 25, 20
-pts = []
-for i in range(n_teeth * 2):
-    angle = i * math.pi / n_teeth
-    r = outer_r if i % 2 == 0 else inner_r
-    pts.append((r * math.cos(angle), r * math.sin(angle)))
-result = cq.Workplane("XY").polyline(pts).close().extrude(8).faces(">Z").workplane().hole(10)
-```
-
-Vase (revolved profile):
-```python
-import cadquery as cq
-pts = [(0, 0), (20, 0), (15, 30), (18, 50), (10, 60), (10, 65), (18, 65), (20, 50), (17, 30), (22, 0)]
-result = cq.Workplane("XZ").polyline(pts).close().revolve(360, (0, 0, 0), (0, 1, 0))
-```
-
-Heart shape:
-```python
-import cadquery as cq
-import math
-pts = []
-for t_int in range(100):
-    t = t_int * 2 * math.pi / 100
-    x = 16 * (math.sin(t) ** 3)
-    y = 13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t)
-    pts.append((x, y))
-result = cq.Workplane("XY").polyline(pts).close().extrude(5)
-```
-
-Text extrusion:
-```python
-import cadquery as cq
-result = cq.Workplane("XY").text("Hi", 10, 3)
-```
-
-## Color Handling
-For "make it yellow", "change color to blue", etc:
-- action: "set_material"
-- params: {"color": "#HEXCODE"}
-
-Color map: yellow=#FFD700, red=#E53935, blue=#1E88E5, green=#43A047,
-silver/grey=#C0C0C0, black=#212121, white=#FAFAFA, orange=#FB8C00, purple=#8E24AA, pink=#EC407A
-
-## Modification Handling
-For "make it bigger", "make it taller", etc. when there's existing code:
-- Modify the dimensions in the current script proportionally
-- action: "generate" with updated script
-
-## Speech-to-text corrections
-Common STT errors: bring/rink→ring, cubes→box, yello→yellow, bill me→build me
+STT: yello→yellow, bill me→build me.
 """
 
 REPAIR_PROMPT = """The previous CadQuery script failed with this error:
@@ -220,43 +156,39 @@ Original script:
 {script}
 ```
 
-Fix the script to resolve the error.
+Fix THIS script. Keep the Assembly and all named parts. Do NOT replace a detailed assembly with a box/cylinder. Fix only the failing part.
 
 ## If error is SECURITY-related (blocked import, blocked builtin, access denied):
-The sandbox only allows these patterns:
 - Imports: ONLY `import cadquery as cq` and `import math`
-- Entry: `cq.Workplane("XY")`, `cq.Workplane("XZ")`, `cq.Workplane("YZ")`
-- 2D: .circle(), .rect(), .polygon(), .polyline(), .close(), .text()
-- 3D: .box(), .cylinder(), .sphere(), .extrude(), .loft(), .revolve()
-- Subtractive: .cut(), .hole()
-- Edges/faces: .fillet(), .chamfer(), .edges(), .faces(), .workplane()
-- Boolean: .union(), .cut(), .intersect() via Workplane methods
-- FORBIDDEN: getattr, setattr, type, object, __import__, exec, eval, open, os, sys, importlib, pathlib, any introspection
-
-Rewrite using ONLY the allowed patterns above. Do NOT try workarounds.
+- cq.Workplane, Sketch, Assembly, Color, Location, Vector
+- .circle/.rect/.polygon/.polyline/.close/.text/.box/.cylinder/.sphere
+- .extrude(height) — NEVER centered= on extrude
+- .loft/.revolve/.sweep — NEVER .cone()
+- .cut/.hole/.union/.fillet/.chamfer/.shell/.transformed
+- FORBIDDEN: getattr, setattr, type, object, exec, eval, open, os, sys, importlib, pathlib, cq.occ_impl
 
 ## Other common issues:
-- Syntax errors: check parentheses, quotes, indentation
-- Invalid operations: some CadQuery methods don't work on all shapes
-- Division issues: ensure no division by zero
-- Import errors: only 'cadquery' and 'math' are available
+- Syntax, parentheses, indentation
+- .extrude(..., centered=...) is INVALID
+- Missing Assembly.add names/colors
+- Division by zero
 
-Return ONLY the corrected JSON:
-{{"action": "generate", "script": "...", "reply": "Fixed: [brief description]"}}
+Return ONLY JSON:
+{{"action":"generate","parts":[...],"script":"...","reply":"Fixed: [brief]"}}
 """
 
 COLOR_MAP = {
-    "yellow": "#FFD700", "gold": "#FFD700",
+    "yellow": "#FFD700", "gold": "#FFD700", "golden": "#FFD700", "yellowish": "#FFD700",
     "red": "#E53935", "crimson": "#DC143C",
-    "blue": "#1E88E5", "navy": "#000080",
-    "green": "#43A047", "lime": "#32CD32",
+    "blue": "#1E88E5", "navy": "#0D47A1",
+    "green": "#43A047", "lime": "#32CD32", "mint": "#66BB6A",
     "silver": "#C0C0C0", "grey": "#C0C0C0", "gray": "#C0C0C0",
     "black": "#212121",
-    "white": "#FAFAFA",
+    "white": "#FAFAFA", "cream": "#FFF3E0",
     "orange": "#FB8C00",
     "purple": "#8E24AA", "violet": "#8E24AA",
     "pink": "#EC407A",
-    "brown": "#795548",
+    "brown": "#795548", "bronze": "#CD7F32",
     "cyan": "#00BCD4", "teal": "#009688",
 }
 
@@ -274,17 +206,10 @@ _HEY_PERCY_ALIASES = re.compile(
     re.IGNORECASE,
 )
 
-# STT false wake-word patterns: "Mercy", "See", "I see" misheard before "Percy"
-# These appear at the start of transcripts as garbage prefixes.
-# We either normalize them to "Percy" (if followed by command) or strip them.
+# STT leftover wake names if the user still says "Percy".
+# Do not treat bare "see" / "I see" as wake words (PTT transcripts are the command).
 _WAKE_WORD_ALIASES = [
-    # "Mercy, can you..." → "Percy, can you..."
     r"^mercy\b",
-    # "See, can you..." → "Percy, can you..." (but not "see" mid-sentence)
-    r"^see\b",
-    # "I see. Can you..." or "I see, can you..." → "Percy, can you..."
-    r"^i see[.,]?\s*",
-    # "Percy" itself is fine but sometimes doubled: "Percy Percy" → "Percy"
     r"^percy[,.]?\s+percy\b",
 ]
 
@@ -298,16 +223,15 @@ def _normalize_wake_word(text: str) -> str:
     - "hey see, make it yellow" → "hey percy, make it yellow"
     - "a mercy build me a ring" → "hey percy, build me a ring"
     
-    Legacy single-word mishearings:
+    Legacy leftover wake names:
     - "Mercy, can you build me a box" → "Percy, can you build me a box"
-    - "See, can you make it yellow" → "can you make it yellow" (stripped)
-    - "I see. Can you build a ring" → "Can you build a ring" (stripped)
+    
+    Bare "see" / "I see" are not stripped (PTT commands can start that way).
     
     Strategy:
     1. If text starts with "hey percy" alias, normalize to "hey percy"
-    2. If text starts with "Mercy", replace with "Percy" (closest mishearing)
-    3. If text starts with "See," or "I see." followed by a command, strip the prefix
-    4. If "Percy Percy", dedupe to single "Percy"
+    2. If text starts with "Mercy", replace with "Percy"
+    3. If "Percy Percy", dedupe to single "Percy"
     """
     t = text.strip()
     lower = t.lower()
@@ -332,26 +256,8 @@ def _normalize_wake_word(text: str) -> str:
     # "Percy Percy" → "Percy"
     match = re.match(r"^percy[,.]?\s+percy\b", lower)
     if match:
-        # Keep just one "Percy" + rest of string after the double
         t = "Percy" + t[match.end():]
         return t.strip()
-    
-    # "See, can you..." or "See. Can you..." → strip "See" prefix
-    # Only if followed by something that looks like a command
-    match = re.match(r"^see[,.]?\s+", lower)
-    if match:
-        rest = t[match.end():]
-        # If rest looks like a command (starts with can/could/make/build/etc.)
-        rest_lower = rest.lower()
-        if any(rest_lower.startswith(w) for w in ["can ", "could ", "make ", "build ", "create ", "change ", "turn "]):
-            return rest
-    
-    # "I see. Can you..." or "I see, can you..." → strip "I see" prefix
-    match = re.match(r"^i see[,.]?\s*", lower)
-    if match:
-        rest = t[match.end():]
-        if rest:  # Don't return empty string
-            return rest
     
     return t
 
@@ -362,7 +268,7 @@ def _normalize_transcript(text: str) -> str:
     
     Steps:
     1. Basic cleanup (whitespace normalization)
-    2. Wake-word normalization (Mercy/See/I see → Percy or stripped)
+    2. Optional leftover "hey percy" / "mercy" prefixes
     3. Common STT word fixes (bill me → build me, yello → yellow)
     """
     t = text.strip()
@@ -379,86 +285,252 @@ def _normalize_transcript(text: str) -> str:
     return lower.strip()
 
 
-def _check_color_only(text: str) -> Intent | None:
-    """Fast path: detect pure color-change requests."""
+_NEW_OBJECT_RE = re.compile(
+    r"\b(build|create|design|generate)\b|"
+    r"\bmake\s+(me\s+)?a\b|"
+    r"\bi want a\b|"
+    r"\bnow\s+(a|make)\b|"
+    r"\binstead\b",
+    re.IGNORECASE,
+)
+_COLOR_WORD_RE = re.compile(r"\b(colou?rs?|paint|painted)\b", re.IGNORECASE)
+_PART_RE = re.compile(
+    r"\b(ears?|tips?|wheels?|tires?|tyres?|body|bodies|heads?|cheeks?|"
+    r"eyes?|windows?|cabin|bumper|handle|handles|arms?|legs?|tail|"
+    r"roof|hood|doors?|hubs?|lights?|headlights?|lug|plate|rims?|"
+    r"holder|keyring|lanyard|"
+    r"cabin|greenhouse|limbs?)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_named_color(text: str) -> str | None:
+    """Return hex for the longest matching color name, if any."""
     t = text.lower()
+    hits: list[tuple[int, str]] = []
     for name, hex_color in COLOR_MAP.items():
-        if re.search(rf"\b{name}\b", t):
-            if any(kw in t for kw in ["color", "make it", "make this", "change", "paint", f"to {name}"]):
-                return Intent(
-                    action="set_material",
-                    params={"color": hex_color},
-                    reply=f"Changed to {name}.",
-                )
-            if t.strip() == name:
-                return Intent(
-                    action="set_material",
-                    params={"color": hex_color},
-                    reply=f"Changed to {name}.",
-                )
-    return None
+        if re.search(rf"\b{re.escape(name)}\b", t):
+            hits.append((len(name), hex_color))
+    if not hits:
+        return None
+    hits.sort(reverse=True)
+    return hits[0][1]
 
 
-def _check_scale_modify(text: str, current_script: str | None) -> Intent | None:
-    """Fast path: detect scale/size modification requests."""
-    if not current_script:
+def _is_new_object_request(text: str) -> bool:
+    return bool(_NEW_OBJECT_RE.search(text))
+
+
+# Dimensional / printable cues force CadQuery (even on a character).
+_CAD_FORCE_RE = re.compile(
+    r"\b("
+    r"mm|millimet(?:er|re)s?|fillet|chamfer|gear|mug|vase|stand|plate|hinge|"
+    r"printable|3d\s*print(?:ed|able|ing)?|keychain|keyring|axle|"
+    r"n_teeth|\d+\s*-?\s*tooth|teeth|hole|holes"
+    r")\b",
+    re.IGNORECASE,
+)
+# Organic / look-like cues — backup when Gemini omits backend.
+_MESH_CUE_RE = re.compile(
+    r"looks\s+like|a\s+model\s+of|"
+    r"\b(?:character|creature|animal|person|human|statue|dragon|corgi|cats?|dogs?|"
+    r"pokemon|pikachu|toy\s+car|cars?|trucks?)\b",
+    re.IGNORECASE,
+)
+_MESH_UNAVAILABLE_REPLY = (
+    "Mesh generation isn't configured. three.ws should work with no key; "
+    "or set NVIDIA_API_KEY / MESHY_API_KEY."
+)
+_MESH_CAD_CLARIFY_REPLY = (
+    "I can't drill a hole in a sculpted mesh like CAD. "
+    "Ask me to build a new CAD part, or keep sculpting this one."
+)
+
+
+_CAD_OBJECT_RE = re.compile(
+    r"\b(box|cube|ring|cylinder|bracket|organizer|nameplate)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_cad_force(text: str) -> bool:
+    return bool(_CAD_FORCE_RE.search(text))
+
+
+def _has_mesh_cue(text: str) -> bool:
+    return bool(_MESH_CUE_RE.search(text))
+
+
+def choose_backend(
+    text: str,
+    session_backend: str | None = None,
+    intent_backend: str | None = None,
+    is_new_object: bool = False,
+) -> str:
+    """
+    Pick cad | mesh | clarify_mesh.
+
+    CAD cues (mm/hole/keychain/print) always win. Mesh-session tweaks stay on
+    mesh unless the user asked for a new CAD object. Gemini's backend field is
+    honored when local cues do not decide.
+    """
+    hinted = (intent_backend or "").strip().lower()
+    if hinted not in ("cad", "mesh"):
+        hinted = None
+    session = (session_backend or "").strip().lower() or None
+    cad_force = _has_cad_force(text)
+    mesh_cue = _has_mesh_cue(text)
+
+    if cad_force:
+        if session == "mesh" and not is_new_object:
+            return "clarify_mesh"
+        return "cad"
+
+    if session == "mesh" and not is_new_object:
+        return "mesh"
+
+    if is_new_object and mesh_cue:
+        return "mesh"
+
+    if _CAD_OBJECT_RE.search(text) and not mesh_cue:
+        return "cad"
+
+    if hinted:
+        return hinted
+
+    if session == "cad" and not is_new_object:
+        return "cad"
+
+    return "cad"
+
+
+def _compose_mesh_prompt(text: str, previous: str | None = None) -> str:
+    """Clean spoken English into a Meshy prompt; append follow-ups."""
+    visual = re.sub(
+        r"^(?:hey\s+percy[,.\s]*)?(?:please\s+)?"
+        r"(?:build|make|create|generate|design)(?:\s+me)?(?:\s+a)?\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    ).strip(" .,")
+    visual = visual or text.strip()
+    if previous:
+        return f"{previous}. Variation: {visual}"
+    return visual
+
+
+def _mesh_generate_intent(text: str, previous_prompt: str | None) -> Intent:
+    prompt = _compose_mesh_prompt(text, previous_prompt)
+    return Intent(
+        action="generate",
+        backend="mesh",
+        mesh_prompt=prompt,
+        script=None,
+        reply="Here's that sculpt.",
+    )
+
+
+def _check_color_only(text: str, has_model: bool = True) -> Intent | None:
+    """
+    Color vocabulary only — not a command phrasebook.
+    New-object requests skip this so Gemini can build the shape.
+    """
+    t = text.lower().strip()
+    if _is_new_object_request(t):
         return None
-    t = text.lower()
-    
-    scale = None
-    direction = None
-    if any(w in t for w in ["bigger", "larger", "scale up"]):
-        scale, direction = 1.25, "bigger"
-    elif any(w in t for w in ["smaller", "scale down", "shrink"]):
-        scale, direction = 0.8, "smaller"
-    elif any(w in t for w in ["taller", "higher"]):
-        scale, direction = 1.35, "taller"
-    elif any(w in t for w in ["shorter", "lower"]):
-        scale, direction = 0.7, "shorter"
-    elif any(w in t for w in ["thicker", "wider"]):
-        scale, direction = 1.3, "thicker"
-    elif any(w in t for w in ["thinner", "narrower"]):
-        scale, direction = 0.75, "thinner"
-    
-    if scale is None:
+
+    named = extract_named_color(t)
+    if named and _PART_RE.search(t):
         return None
-    
-    modified = _scale_dimensions_in_script(current_script, scale, direction)
-    if modified != current_script:
+    if named:
         return Intent(
-            action="generate",
-            script=modified,
-            reply=f"Made it {direction}.",
+            action="set_material",
+            params={"color": named},
+            reply="Changed the color.",
         )
+
+    if has_model and _COLOR_WORD_RE.search(t) and not named:
+        return Intent(action="clarify", reply="What color?")
+
     return None
 
 
-def _scale_dimensions_in_script(script: str, scale: float, direction: str) -> str:
-    """Scale numeric dimensions in a CadQuery script."""
-    def scale_number(match):
-        num = float(match.group(0))
-        if num > 0.5:
-            return str(round(num * scale, 2))
-        return match.group(0)
-    
-    lines = script.split('\n')
-    modified_lines = []
-    for line in lines:
-        if 'import' in line or line.strip().startswith('#'):
-            modified_lines.append(line)
-        else:
-            modified_lines.append(re.sub(r'\b\d+\.?\d*\b', scale_number, line))
-    
-    return '\n'.join(modified_lines)
+# Size vocabulary, in the same spirit as the colour map: words for a magnitude,
+# not a phrasebook of commands. A sculpt has no editable script, so resizing it
+# is a display change; CAD keeps going through codegen so the millimetres stay real.
+_SCALE_FACTORS: tuple[tuple[str, float], ...] = (
+    (r"\btwice as (?:big|large)\b|\bdouble\b|\b2x\b", 2.0),
+    (r"\bhalf (?:the )?(?:size|as big)\b|\bhalf\b", 0.5),
+    (r"\b(?:way|much|a lot) (?:bigger|larger)\b|\bhuge\b|\bmassive\b", 2.0),
+    (r"\b(?:way|much|a lot) smaller\b|\btiny\b|\bminiature\b", 0.5),
+    (r"\b(?:a )?(?:bit|little|touch|slightly) (?:bigger|larger)\b", 1.2),
+    (r"\b(?:a )?(?:bit|little|touch|slightly) smaller\b", 0.83),
+    (r"\bbigger\b|\blarger\b|\bscale (?:it )?up\b|\bgrow\b", 1.5),
+    (r"\bsmaller\b|\bshrink\b|\bscale (?:it )?down\b", 0.67),
+)
+_SCALE_RE = re.compile("|".join(p for p, _f in _SCALE_FACTORS), re.I)
+
+
+def _check_scale_only(text: str) -> Intent | None:
+    """Pure resize of an existing sculpt — no need to re-sculpt it."""
+    t = text.lower().strip()
+    if _is_new_object_request(t) or not _SCALE_RE.search(t):
+        return None
+    # "make the ears bigger" is a shape edit, not a resize of the whole model.
+    if _PART_RE.search(t) or extract_named_color(t):
+        return None
+
+    for pattern, factor in _SCALE_FACTORS:
+        if re.search(pattern, t, re.I):
+            word = "bigger" if factor > 1 else "smaller"
+            return Intent(
+                action="set_scale",
+                params={"factor": factor},
+                reply=f"Made it {word}.",
+            )
+    return None
+
+
+def _build_user_payload(
+    text: str,
+    current_script: str | None = None,
+    last_summary: str | None = None,
+    current_color: str | None = None,
+) -> str:
+    payload: dict[str, Any] = {"utterance": text}
+    if current_script:
+        payload["has_existing_model"] = True
+        payload["current_script"] = current_script
+        payload["instruction"] = (
+            "Edit current_script unless the user asked for a different object. "
+            "Keep the Assembly and named parts; change dimensions or cq.Color. "
+            "Do not scale loop counts or range(). "
+            "A part name plus a color means edit those parts, not set_material."
+        )
+    else:
+        payload["has_existing_model"] = False
+    if last_summary:
+        payload["last_summary"] = last_summary
+    if current_color:
+        payload["current_color"] = current_color
+    return json.dumps(payload)
 
 
 def _parse_json_response(raw: str) -> dict:
-    """Parse JSON from LLM response, handling markdown fences."""
+    """Parse JSON from LLM response, handling markdown fences and trailing junk."""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        if start < 0:
+            raise
+        obj, _idx = json.JSONDecoder().raw_decode(raw[start:])
+        return obj
 
 
 async def _gemini_codegen(
@@ -466,6 +538,8 @@ async def _gemini_codegen(
     settings: Settings,
     current_script: str | None = None,
     last_error: str | None = None,
+    last_summary: str | None = None,
+    current_color: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via Gemini API."""
     import httpx
@@ -475,17 +549,18 @@ async def _gemini_codegen(
 
     if last_error and current_script:
         user_content = REPAIR_PROMPT.format(error=last_error, script=current_script)
+        temperature = 0.15
     else:
-        context = {"utterance": text}
-        if current_script:
-            context["current_script"] = current_script
-        user_content = json.dumps(context)
+        user_content = _build_user_payload(
+            text, current_script, last_summary, current_color
+        )
+        temperature = 0.15 if current_script else 0.4
 
     payload = {
         "system_instruction": {"parts": [{"text": CODEGEN_SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_content}]}],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": temperature,
             "responseMimeType": "application/json",
         },
     }
@@ -515,6 +590,8 @@ async def _openai_codegen(
     settings: Settings,
     current_script: str | None = None,
     last_error: str | None = None,
+    last_summary: str | None = None,
+    current_color: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via OpenAI API."""
     from openai import AsyncOpenAI
@@ -523,15 +600,16 @@ async def _openai_codegen(
 
     if last_error and current_script:
         user_content = REPAIR_PROMPT.format(error=last_error, script=current_script)
+        temperature = 0.15
     else:
-        context = {"utterance": text}
-        if current_script:
-            context["current_script"] = current_script
-        user_content = json.dumps(context)
+        user_content = _build_user_payload(
+            text, current_script, last_summary, current_color
+        )
+        temperature = 0.15 if current_script else 0.4
 
     resp = await client.chat.completions.create(
         model=settings.openai_model,
-        temperature=0.2,
+        temperature=temperature,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": CODEGEN_SYSTEM_PROMPT},
@@ -548,24 +626,64 @@ async def generate_code(
     settings: Settings,
     current_script: str | None = None,
     last_error: str | None = None,
+    last_summary: str | None = None,
+    current_color: str | None = None,
 ) -> Intent:
     """Generate CadQuery code from natural language using LLM."""
+    kwargs = {
+        "text": text,
+        "settings": settings,
+        "current_script": current_script,
+        "last_error": last_error,
+        "last_summary": last_summary,
+        "current_color": current_color,
+    }
     if settings.gemini_api_key:
         try:
-            return await _gemini_codegen(text, settings, current_script, last_error)
+            return await _gemini_codegen(**kwargs)
         except Exception as exc:
-            logger.warning("Gemini codegen failed (%s); trying OpenAI", exc)
+            logger.warning("Gemini codegen failed (%s)", exc)
+            if kwargs.get("current_script") and not kwargs.get("last_error"):
+                try:
+                    logger.info("Retrying Gemini as a new object (no current_script)")
+                    kwargs = {**kwargs, "current_script": None}
+                    return await _gemini_codegen(**kwargs)
+                except Exception as exc2:
+                    logger.warning("Gemini retry failed (%s); trying OpenAI", exc2)
+            else:
+                logger.warning("Trying OpenAI fallback")
 
     if settings.openai_api_key:
         try:
-            return await _openai_codegen(text, settings, current_script, last_error)
+            return await _openai_codegen(**kwargs)
         except Exception as exc:
             logger.warning("OpenAI codegen failed (%s)", exc)
 
+    keyed = bool(settings.gemini_api_key or settings.openai_api_key)
     return Intent(
         action="clarify",
-        reply="Code generation unavailable. Please configure GEMINI_API_KEY or OPENAI_API_KEY.",
+        reply=(
+            "I couldn't generate that model. Try saying it again."
+            if keyed
+            else "Code generation unavailable. Please configure GEMINI_API_KEY or OPENAI_API_KEY."
+        ),
     )
+
+
+def _unavailable_or_mesh_intent(
+    text: str,
+    settings: Settings,
+    previous_prompt: str | None,
+) -> Intent:
+    from mesh.factory import mesh_ready
+
+    if not mesh_ready(settings):
+        return Intent(
+            action="clarify",
+            backend="mesh",
+            reply=_MESH_UNAVAILABLE_REPLY,
+        )
+    return _mesh_generate_intent(text, previous_prompt)
 
 
 async def parse_intent(
@@ -574,34 +692,112 @@ async def parse_intent(
     current_template: str | None,
     current_params: dict[str, Any],
     current_script: str | None = None,
+    last_summary: str | None = None,
+    current_color: str | None = None,
+    last_backend: str | None = None,
+    last_mesh_prompt: str | None = None,
 ) -> tuple[Intent, float]:
     """
-    Parse user utterance into Intent with CadQuery script.
-    
+    Parse user utterance into Intent (CadQuery script or mesh prompt).
+
     Flow:
     1. Normalize STT errors
-    2. Fast path: pure color changes
-    3. Fast path: scale/size modifications (if script exists)
-    4. LLM codegen: generate CadQuery Python for any shape
-    
+    2. Route cad vs mesh (CAD cues, organic cues, session)
+    3. Fast path: named color only on CAD sessions
+    4. Mesh: skip sandbox codegen. CAD: LLM script, new object drops current_script.
+
     Returns (Intent, latency_ms).
     """
     t0 = time.perf_counter()
     cleaned = _normalize_transcript(text)
     logger.info("Intent parsing: %r", cleaned)
 
-    color_intent = _check_color_only(cleaned)
+    if is_photo_search(cleaned):
+        query = photo_query(cleaned)
+        logger.info("Photo search → %r", query)
+        return (
+            Intent(
+                action="find_photos",
+                backend="mesh",
+                photo_query=query,
+                reply="Let me pull that up.",
+            ),
+            (time.perf_counter() - t0) * 1000,
+        )
+
+    is_new = _is_new_object_request(cleaned)
+    session_backend = last_backend or ("cad" if current_script or current_template else None)
+    routed = choose_backend(
+        cleaned,
+        session_backend=session_backend,
+        is_new_object=is_new,
+    )
+    logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
+
+    if session_backend == "mesh" and not is_new:
+        scale_intent = _check_scale_only(cleaned)
+        if scale_intent:
+            scale_intent.backend = "mesh"
+            logger.info("Fast path: resize x%.2f", scale_intent.params["factor"])
+            return scale_intent, (time.perf_counter() - t0) * 1000
+
+    if routed == "clarify_mesh":
+        return (
+            Intent(action="clarify", backend="mesh", reply=_MESH_CAD_CLARIFY_REPLY),
+            (time.perf_counter() - t0) * 1000,
+        )
+
+    if routed == "mesh":
+        prev = last_mesh_prompt if session_backend == "mesh" and not is_new else None
+        intent = _unavailable_or_mesh_intent(cleaned, settings, prev)
+        logger.info("Mesh path → action=%s", intent.action)
+        return intent, (time.perf_counter() - t0) * 1000
+
+    has_model = bool(current_script or current_template)
+    color_intent = _check_color_only(cleaned, has_model=has_model)
     if color_intent:
-        logger.info("Fast path: color change → %s", color_intent.params.get("color"))
+        color_intent.backend = "cad"
+        if color_intent.action == "set_material":
+            logger.info("Fast path: color change → %s", color_intent.params.get("color"))
+        else:
+            logger.info("Fast path: color clarify")
         return color_intent, (time.perf_counter() - t0) * 1000
 
-    scale_intent = _check_scale_modify(cleaned, current_script)
-    if scale_intent:
-        logger.info("Fast path: scale modification")
-        return scale_intent, (time.perf_counter() - t0) * 1000
+    script_for_llm = current_script
+    if current_script and is_new:
+        logger.info("New object request — not sending current_script to codegen")
+        script_for_llm = None
 
-    intent = await generate_code(cleaned, settings, current_script)
-    logger.info("LLM codegen → action=%s", intent.action)
+    intent = await generate_code(
+        cleaned,
+        settings,
+        current_script=script_for_llm,
+        last_summary=last_summary if script_for_llm else None,
+        current_color=current_color or (current_params or {}).get("color"),
+    )
+    final = choose_backend(
+        cleaned,
+        session_backend=session_backend,
+        intent_backend=intent.backend,
+        is_new_object=is_new,
+    )
+    if final == "clarify_mesh":
+        intent = Intent(action="clarify", backend="mesh", reply=_MESH_CAD_CLARIFY_REPLY)
+    elif final == "mesh":
+        prev = last_mesh_prompt if session_backend == "mesh" and not is_new else None
+        if intent.mesh_prompt:
+            mesh_intent = _unavailable_or_mesh_intent(cleaned, settings, prev)
+            if mesh_intent.action == "generate":
+                mesh_intent.mesh_prompt = intent.mesh_prompt
+                mesh_intent.reply = intent.reply or mesh_intent.reply
+                mesh_intent.size_mm = intent.size_mm
+            intent = mesh_intent
+        else:
+            intent = _unavailable_or_mesh_intent(cleaned, settings, prev)
+    else:
+        intent.backend = "cad"
+        intent.mesh_prompt = None
+    logger.info("LLM codegen → action=%s backend=%s", intent.action, intent.backend)
     return intent, (time.perf_counter() - t0) * 1000
 
 

@@ -22,11 +22,23 @@ class Intent(BaseModel):
     template: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     script: str | None = None
+    parts: list[dict[str, Any]] = Field(default_factory=list)
     reply: str = "Okay."
+    backend: str = "cad"  # cad | mesh
+    mesh_prompt: str | None = None
+    # Longest real-world dimension the object should have, in mm.
+    size_mm: float | None = None
+    # What's in the photo the user wants pulled from Drive.
+    photo_query: str | None = None
 
 
 class CommandRequest(BaseModel):
     text: str
+    session_id: str = "default"
+
+
+class PhotoChooseRequest(BaseModel):
+    file_id: str
     session_id: str = "default"
 
 
@@ -45,6 +57,15 @@ class SessionState(BaseModel):
     model_id: str | None = None
     glb_url: str | None = None
     last_script: str | None = None
+    last_summary: str | None = None
+    last_backend: str = "cad"  # cad | mesh
+    last_mesh_prompt: str | None = None
+    # Longest real-world dimension in metres, before the user's own resizing.
+    base_size_m: float = 0.20
+    # What "make it bigger" has done to it since.
+    scale: float = 1.0
+    # Last Drive photo search; each item has id, name, preview_url, build_url.
+    last_photos: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CommandResponse(BaseModel):
@@ -60,3 +81,9 @@ class CommandResponse(BaseModel):
     session: SessionState
     latency_ms: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
+    textured: bool = False
+    backend: str | None = None
+    # Longest dimension the client should render, in metres.
+    display_size_m: float | None = None
+    # Drive photo matches for the AR picker. Empty unless action is find_photos.
+    candidates: list[dict[str, Any]] = Field(default_factory=list)

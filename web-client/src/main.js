@@ -2,9 +2,8 @@
  * Perception CAD - WebXR Passthrough AR Client
  *
  * Voice-driven CAD on Quest 3 via passthrough AR.
- * Percy wake word → VAD listen → STT/Gemini → CadQuery → GLB render
+ * Left PTT → STT/Gemini → CadQuery → GLB. Right pinch near model → grab.
  *
- * Chrome stripped: No tutorial UI, no PTT buttons.
  * VoiceState hooks exposed for in-world HUD (design owns visuals).
  */
 
@@ -17,6 +16,10 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 import { PercyAssistant } from "./voice/PercyAssistant.js";
 import { voiceState, VoiceStates } from "./voice/VoiceState.js";
+import { PhotoPicker } from "./PhotoPicker.js";
+
+// Desktop XR emulation is injected by @iwsdk/vite-plugin-dev (localhost only).
+// Quest / LAN IP keep native WebXR — do not manually install IWER here.
 
 const params = new URLSearchParams(window.location.search);
 const DEBUG_HUD = params.has("debug") && (params.get("debug") === "hud" || params.get("debug") === "1" || params.get("debug") === "true" || params.get("debug") === "");
@@ -66,14 +69,17 @@ scene.background = null;
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
 camera.position.set(0, 1.5, 0.8);
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.85));
-scene.add(new THREE.HemisphereLight(0xffffff, 0xb0b0b0, 1.2));
-const key = new THREE.DirectionalLight(0xffffff, 1.4);
+scene.add(new THREE.AmbientLight(0xffffff, 1.6));
+scene.add(new THREE.HemisphereLight(0xffffff, 0xd0d0d0, 1.8));
+const key = new THREE.DirectionalLight(0xffffff, 2.2);
 key.position.set(0.8, 2.5, 1.2);
 scene.add(key);
-const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+const fill = new THREE.DirectionalLight(0xffffff, 1.1);
 fill.position.set(-1.5, 1.5, -0.5);
 scene.add(fill);
+const rim = new THREE.DirectionalLight(0xffffff, 0.8);
+rim.position.set(0, 1.2, -2);
+scene.add(rim);
 
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -118,8 +124,6 @@ const VOICE_COLORS = {
   speaking: 0x4caf50,
   error: 0xff5722,
   muted: 0x9e9e9e,
-  wake_tentative: 0xffab00, // Amber for tentative wake detection
-  wake_miss: 0xff6d00,      // Orange flash for missed wake / retry
 };
 
 const voiceRing = new THREE.Mesh(
@@ -155,9 +159,6 @@ const muteIndicator = new THREE.Mesh(
 muteIndicator.position.set(0, 0, 0.02);
 voiceIndicatorGroup.add(muteIndicator);
 
-let wakeTentativeFlashPhase = 0;
-let wakeMissFlashActive = false;
-
 function updateVoiceIndicator(state) {
   const color = VOICE_COLORS[state] || VOICE_COLORS.idle;
   voiceRing.material.color.setHex(color);
@@ -171,18 +172,9 @@ function updateVoiceIndicator(state) {
     voiceRing.scale.setScalar(1.0);
   } else if (state === "speaking") {
     voiceRing.scale.setScalar(1.1);
-  } else if (state === "wake_tentative") {
-    wakeTentativeFlashPhase = 0;
-    voiceRing.scale.setScalar(1.15);
-    voiceDot.scale.setScalar(1.2);
-  } else if (state === "wake_miss") {
-    wakeMissFlashActive = true;
-    voiceRing.scale.setScalar(1.3);
-    voiceDot.scale.setScalar(1.4);
   } else {
     voiceRing.scale.setScalar(1.0);
     voiceDot.scale.setScalar(1.0);
-    wakeMissFlashActive = false;
   }
 }
 
@@ -196,6 +188,8 @@ const _camPos = new THREE.Vector3();
 const _camQuat = new THREE.Quaternion();
 const _forward = new THREE.Vector3();
 let grabbing = false;
+
+const photoPicker = new PhotoPicker(scene, () => camera);
 
 function placeModelInFrontOfUser(distance = 0.7) {
   const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
@@ -236,21 +230,118 @@ function layoutVoiceIndicator() {
   voiceIndicatorGroup.quaternion.copy(_camQuat);
 }
 
-function prepareVisibleMaterials(root, hex) {
-  const color = new THREE.Color(hex || currentColor);
+function ensureOutwardNormals(geometry) {
+  if (!geometry?.attributes?.position) return;
+  geometry.computeVertexNormals();
+  const pos = geometry.attributes.position;
+  const nrm = geometry.attributes.normal;
+  if (!nrm) return;
+
+  const c = new THREE.Vector3();
+  const p = new THREE.Vector3();
+  const n = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    c.add(p.fromBufferAttribute(pos, i));
+  }
+  c.divideScalar(Math.max(pos.count, 1));
+
+  let votes = 0;
+  const step = Math.max(1, Math.floor(pos.count / 250));
+  for (let i = 0; i < pos.count; i += step) {
+    p.fromBufferAttribute(pos, i);
+    n.fromBufferAttribute(nrm, i);
+    votes += n.dot(p.sub(c)) >= 0 ? 1 : -1;
+  }
+  if (votes >= 0) return;
+
+  for (let i = 0; i < nrm.count; i++) {
+    nrm.setXYZ(i, -nrm.getX(i), -nrm.getY(i), -nrm.getZ(i));
+  }
+  nrm.needsUpdate = true;
+  if (geometry.index) {
+    const a = geometry.index.array;
+    for (let i = 0; i < a.length; i += 3) {
+      const tmp = a[i + 1];
+      a[i + 1] = a[i + 2];
+      a[i + 2] = tmp;
+    }
+    geometry.index.needsUpdate = true;
+  }
+}
+
+function hologramMaterialFromColor(color) {
+  const c = color.clone();
+  return new THREE.MeshLambertMaterial({
+    color: c,
+    emissive: c.clone(),
+    emissiveIntensity: 0.65,
+    side: THREE.DoubleSide,
+    vertexColors: false,
+  });
+}
+
+function hologramMaterial(hex) {
+  return hologramMaterialFromColor(new THREE.Color(hex || currentColor));
+}
+
+function meshAlbedo(child, fallbackHex) {
+  const attr = child.geometry?.attributes?.color;
+  if (attr && attr.count) {
+    let r = attr.getX(0);
+    let g = attr.getY(0);
+    let b = attr.getZ(0);
+    if (r > 1 || g > 1 || b > 1) {
+      r /= 255;
+      g /= 255;
+      b /= 255;
+    }
+    if (r + g + b > 0.04) return new THREE.Color(r, g, b);
+  }
+  const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+  if (mat?.color) {
+    const c = mat.color;
+    if (c.r + c.g + c.b > 0.04) return c.clone();
+  }
+  return new THREE.Color(fallbackHex || currentColor);
+}
+
+function prepareVisibleMaterials(root, hex, textured = false) {
+  const meshes = [];
   root.traverse((child) => {
-    if (!child.isMesh) return;
+    if (child.isMesh) meshes.push(child);
+  });
+  if (textured) {
+    meshes.forEach((child) => {
+      child.frustumCulled = false;
+      child.castShadow = false;
+      child.receiveShadow = false;
+      if (child.geometry) ensureOutwardNormals(child.geometry);
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        m.side = THREE.DoubleSide;
+        m.needsUpdate = true;
+      });
+    });
+    return;
+  }
+  const colors = meshes.map((m) => meshAlbedo(m, hex));
+  const unique = new Set(colors.map((c) => c.getHexString()));
+  const keepParts = unique.size > 1;
+  meshes.forEach((child, i) => {
     child.frustumCulled = false;
     child.castShadow = false;
     child.receiveShadow = false;
-    const neu = new THREE.MeshStandardMaterial({
-      color: color.clone(),
-      roughness: 0.32,
-      metalness: 0.08,
-      emissive: color.clone().multiplyScalar(0.18),
-      envMapIntensity: 1.0,
-    });
-    child.material = neu;
+    const col = keepParts ? colors[i] : new THREE.Color(hex || currentColor);
+    if (child.geometry) {
+      child.geometry.deleteAttribute("color");
+      ensureOutwardNormals(child.geometry);
+    }
+    if (child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => m.dispose?.());
+    }
+    child.material = hologramMaterialFromColor(col);
   });
 }
 
@@ -261,25 +352,40 @@ function loadGlb(url) {
 }
 
 function applyColorToObject(obj, hex) {
-  const color = new THREE.Color(hex);
   obj.traverse((child) => {
-    if (!child.isMesh || !child.material) return;
-    const mats = Array.isArray(child.material) ? child.material : [child.material];
-    for (const m of mats) {
-      if (m.color) m.color.copy(color);
-      if (m.emissive) m.emissive.copy(color).multiplyScalar(0.18);
-      m.needsUpdate = true;
+    if (!child.isMesh) return;
+    if (child.geometry?.attributes?.color) child.geometry.deleteAttribute("color");
+    if (child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => m.dispose());
     }
+    child.material = hologramMaterial(hex);
   });
 }
 
 let lastLoadedGlbUrl = null;
 let lastModelId = null;
+let lastTextured = false;
+// Longest edge the model should occupy, in metres. The backend decides it:
+// CAD parts arrive life size, sculpts get an estimate, and "make it bigger"
+// just moves this number.
+const DEFAULT_DISPLAY_SIZE_M = 0.22;
+let modelBaseMaxDim = 1;
+
+function applyDisplaySize(obj, displaySizeM) {
+  obj.scale.setScalar(displaySizeM / modelBaseMaxDim);
+  const box = new THREE.Box3().setFromObject(obj);
+  obj.position.sub(box.getCenter(new THREE.Vector3()));
+}
 
 async function setModelFromResponse(data) {
+  if (data.action === "find_photos") {
+    return;
+  }
   const newColor = data.color || currentColor;
   const newGlbUrl = data.glb_url;
   const newModelId = data.model_id;
+  const displaySizeM = data.display_size_m || DEFAULT_DISPLAY_SIZE_M;
   
   // Contract: if rebuilt && model_id && glb_url → load new GLB + swap mesh
   // Color path now always returns fresh model_id/glb_url with rebuilt:true
@@ -300,12 +406,12 @@ async function setModelFromResponse(data) {
       const sceneObj = await loadGlb(bust);
       const box = new THREE.Box3().setFromObject(sceneObj);
       const size = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y, size.z) || 1;
-      sceneObj.scale.setScalar(0.22 / maxDim);
-      box.setFromObject(sceneObj);
-      sceneObj.position.sub(box.getCenter(new THREE.Vector3()));
+      modelBaseMaxDim = Math.max(size.x, size.y, size.z) || 1;
+      applyDisplaySize(sceneObj, displaySizeM);
 
-      prepareVisibleMaterials(sceneObj, currentColor);
+      const textured = Boolean(data.textured || data.backend === "mesh");
+      lastTextured = textured;
+      prepareVisibleMaterials(sceneObj, currentColor, textured);
 
       const wasGrabbing = grabbing;
       const savedSource = grabSource;
@@ -334,6 +440,7 @@ async function setModelFromResponse(data) {
       modelRoot.add(currentModel);
       lastLoadedGlbUrl = newGlbUrl;
       lastModelId = newModelId;
+      photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
         grabOffset.copy(savedOffset);
@@ -350,8 +457,12 @@ async function setModelFromResponse(data) {
       console.error("[Percy] Failed to load GLB:", err);
       clearStaleGrabRefs();
     }
-  } else if (data.color && currentModel) {
-    // Color-only update (no new model) - apply directly to existing mesh
+  } else if (data.action === "set_scale" && currentModel) {
+    // Resizing a sculpt ships no new GLB — rescale what is already loaded.
+    applyDisplaySize(currentModel, displaySizeM);
+    console.log("[Percy] Resized to", displaySizeM.toFixed(3), "m");
+  } else if (data.color && currentModel && !lastTextured) {
+    // Color-only update (no new model) - apply hologram paint on CAD only
     applyColorToObject(currentModel, currentColor);
     console.log("[Percy] Applied color update:", currentColor);
   }
@@ -514,7 +625,10 @@ function updateGrab() {
 function pollHand(handEntry, key) {
   const gap = updatePinchAnchor(handEntry);
   if (gap === null) {
-    if (wasPinching[key] && grabHandKey === key) endGrab();
+    if (wasPinching[key]) {
+      if (key === 0) percy.endTalk();
+      if (grabHandKey === key) endGrab();
+    }
     wasPinching[key] = false;
     pinchStartTime[key] = 0;
     return;
@@ -526,7 +640,26 @@ function pollHand(handEntry, key) {
   const isPinching = gap < PINCH_THRESHOLD_START;
   const wasOpen = gap > PINCH_THRESHOLD_END;
 
-  if (!grabbing) {
+  if (key === 1 && photoPicker.isOpen) {
+    if (isPinching && !wasPinching[key]) {
+      photoPicker.beginPinch(pos);
+    } else if (isPinching && wasPinching[key]) {
+      photoPicker.movePinch(pos);
+    }
+    if (wasOpen && wasPinching[key]) {
+      const picked = photoPicker.endPinch(pos);
+      if (picked) {
+        photoPicker.keepOnly(picked);
+        photoPicker.busy = true;
+        setStatus("Building that from the photo…", true);
+        percy.choosePhoto(picked);
+      }
+    }
+    wasPinching[key] = isPinching;
+    return;
+  }
+
+  if (key === 1 && !grabbing) {
     getModelCenter(_modelCenter);
     const dist = pos.distanceTo(_modelCenter);
     if (dist < GRAB_RANGE) {
@@ -536,35 +669,73 @@ function pollHand(handEntry, key) {
 
   if (isPinching && !wasPinching[key]) {
     pinchStartTime[key] = now;
+    if (key === 0) percy.beginTalk();
   }
 
-  if (isPinching && wasPinching[key] && !grabbing) {
+  if (key === 1 && isPinching && wasPinching[key] && !grabbing) {
     const duration = now - pinchStartTime[key];
     if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
       beginGrab(handEntry.pinchAnchor, key);
     }
   }
 
-  if (wasOpen && wasPinching[key] && grabHandKey === key) {
-    endGrab();
+  if (wasOpen && wasPinching[key]) {
+    if (key === 0) percy.endTalk();
+    if (grabHandKey === key) endGrab();
   }
 
   wasPinching[key] = isPinching;
 }
 
-for (const entry of [left, right]) {
-  entry.controller.addEventListener("selectstart", () => {
-    entry.controller.getWorldPosition(_pinch);
-    if (nearModel(_pinch, GRAB_RANGE)) beginGrab(entry.controller, -1);
-  });
-  entry.controller.addEventListener("selectend", () => {
-    if (grabSource === entry.controller) endGrab();
-  });
-}
+left.controller.addEventListener("selectstart", () => {
+  percy.beginTalk();
+});
+left.controller.addEventListener("selectend", () => {
+  percy.endTalk();
+});
+
+right.controller.addEventListener("selectstart", () => {
+  right.controller.getWorldPosition(_pinch);
+  if (photoPicker.isOpen) {
+    photoPicker.beginPinch(_pinch);
+    return;
+  }
+  if (nearModel(_pinch, GRAB_RANGE)) beginGrab(right.controller, -1);
+});
+right.controller.addEventListener("selectend", () => {
+  if (photoPicker.isOpen) {
+    right.controller.getWorldPosition(_pinch);
+    const picked = photoPicker.endPinch(_pinch);
+    if (picked) {
+      photoPicker.keepOnly(picked);
+      photoPicker.busy = true;
+      setStatus("Building that from the photo…", true);
+      percy.choosePhoto(picked);
+    }
+    return;
+  }
+  if (grabSource === right.controller) endGrab();
+});
 
 const percy = new PercyAssistant({
   onModelUpdate: (data) => setModelFromResponse(data),
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
+  onPhotoCandidates: (cands) => {
+    if (!cands || !cands.length) {
+      photoPicker.hide();
+      return;
+    }
+    photoPicker.show(cands, renderer).then(() => {
+      setStatus("Pinch to pick a photo. Drag sideways to swipe.", true);
+    }).catch((err) => {
+      console.error("[Percy] Photo picker failed:", err);
+      setStatus("Found the photo but couldn't show it.", false);
+    });
+  },
+  onTalkingChange: (talking) => {
+    const mic = document.getElementById("micButton");
+    mic?.classList.toggle("talking", talking);
+  },
 });
 
 voiceState.subscribe((snapshot) => {
@@ -578,6 +749,7 @@ window.addEventListener("resize", () => {
 });
 
 let pulsePhase = 0;
+let lastTick = performance.now();
 
 renderer.setAnimationLoop(() => {
   if (needsUserPlacement && renderer.xr.isPresenting) {
@@ -585,7 +757,7 @@ renderer.setAnimationLoop(() => {
     if (placeFrameCount >= 3) {
       placeModelInFrontOfUser(0.7);
       needsUserPlacement = false;
-      setStatus("Say 'Hey Percy' to give a command. Pinch model to grab.", true);
+      setStatus("Hold left trigger to talk. Right pinch the model to move it.", true);
     }
   }
 
@@ -604,20 +776,6 @@ renderer.setAnimationLoop(() => {
     } else if (state === "speaking") {
       const pulse = 1.0 + 0.1 * Math.sin(pulsePhase * 3);
       voiceDot.scale.setScalar(pulse);
-    } else if (state === "wake_tentative") {
-      wakeTentativeFlashPhase += 0.15;
-      const pulse = 1.1 + 0.2 * Math.sin(wakeTentativeFlashPhase * 4);
-      const opacity = 0.6 + 0.35 * Math.sin(wakeTentativeFlashPhase * 4);
-      voiceRing.scale.setScalar(pulse);
-      voiceDot.scale.setScalar(pulse);
-      voiceRing.material.opacity = opacity;
-      voiceDot.material.opacity = opacity;
-    } else if (state === "wake_miss") {
-      const flashPulse = 1.2 + 0.25 * Math.sin(pulsePhase * 6);
-      voiceRing.scale.setScalar(flashPulse);
-      voiceDot.scale.setScalar(flashPulse);
-      voiceRing.material.opacity = 0.9;
-      voiceDot.material.opacity = 0.95;
     } else {
       voiceRing.material.opacity = 0.85;
       voiceDot.material.opacity = 0.9;
@@ -627,6 +785,9 @@ renderer.setAnimationLoop(() => {
   pollHand(left, 0);
   pollHand(right, 1);
   updateGrab();
+  const nowTick = performance.now();
+  photoPicker.tick((nowTick - lastTick) / 1000);
+  lastTick = nowTick;
 
   if (!grabbing) {
     const decay = 0.92;
@@ -647,6 +808,18 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
   pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  if (photoPicker.isOpen) {
+    const hits = raycaster.intersectObjects(photoPicker.cards, true);
+    const card = hits[0]?.object;
+    const fileId = card?.userData?.fileId || card?.parent?.userData?.fileId;
+    if (fileId) {
+      photoPicker.keepOnly(fileId);
+      photoPicker.busy = true;
+      setStatus("Building that from the photo…", true);
+      percy.choosePhoto(fileId);
+    }
+    return;
+  }
   const target = modelInteractTarget();
   if (target && raycaster.intersectObject(target, true).length) {
     desktopMode = e.shiftKey ? "spin" : "move";
@@ -673,14 +846,43 @@ window.addEventListener("pointermove", (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "m" || e.key === "M") {
     percy.toggleMute();
+    return;
+  }
+  if (e.code === "Space" && !e.repeat) {
+    e.preventDefault();
+    percy.beginTalk();
   }
 });
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space") {
+    e.preventDefault();
+    percy.endTalk();
+  }
+});
+
+const micButton = document.getElementById("micButton");
+if (micButton) {
+  const holdStart = (e) => {
+    e.preventDefault();
+    percy.beginTalk();
+  };
+  const holdEnd = (e) => {
+    e.preventDefault();
+    percy.endTalk();
+  };
+  micButton.addEventListener("pointerdown", holdStart);
+  micButton.addEventListener("pointerup", holdEnd);
+  micButton.addEventListener("pointercancel", holdEnd);
+  micButton.addEventListener("pointerleave", (e) => {
+    if (e.buttons) holdEnd(e);
+  });
+}
 
 fetch(`${API_BASE}/api/health`)
   .then((r) => r.json())
   .then((h) => {
     const status = `CadQuery ${h.cadquery ? "✓" : "✗"} · Voice ${h.stt && h.tts ? "✓" : "partial"}`;
-    setStatus(`Percy ready. Say 'Hey Percy' to activate. ${status}`, true);
+    setStatus(`Percy ready. Hold mic / left trigger to talk. ${status}`, true);
     percy.start();
   })
   .catch(() => {
@@ -700,13 +902,13 @@ window.PerceptionCAD = {
     else if (state === VoiceStates.THINKING) voiceState.toThinking();
     else if (state === VoiceStates.SPEAKING) voiceState.toSpeaking();
     else if (state === VoiceStates.ERROR) voiceState.toError();
-    else if (state === VoiceStates.WAKE_TENTATIVE) voiceState.toWakeTentative();
-    else if (state === VoiceStates.WAKE_MISS) voiceState.toWakeMiss();
   },
   isMuted: () => voiceState.isMuted,
   toggleMute: () => percy.toggleMute(),
-  startListening: () => percy._onWakeWord(),
-  stopListening: () => {},
+  startListening: () => percy.beginTalk(),
+  stopListening: () => percy.endTalk(),
+  beginTalk: () => percy.beginTalk(),
+  endTalk: () => percy.endTalk(),
   sendCommand: (text) => percy.sendTextCommand(text),
   onVoiceStateChange: (callback) => voiceState.subscribe(callback),
   

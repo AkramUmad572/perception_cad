@@ -31,8 +31,10 @@
 
 ### Remaining Fast Paths
 
-- **Color changes**: Detected client-side, `action="set_material"`
-- **Scale modifications**: "bigger", "smaller", etc. scale dimensions in existing script
+- **Color changes**: Named colors (`yellow`, `navy`, `gold`, …) map to hex and
+  `action="set_material"`. Saying "color"/"paint" with no name returns `clarify`.
+- **Scale / geometry follow-ups**: Gemini edits `current_script` using `last_summary`.
+  There is no regex that multiplies every number in the script.
 
 ---
 

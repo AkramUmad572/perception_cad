@@ -34,6 +34,27 @@
         position: fixed; top: 16px; right: 16px; z-index: 12;
       }
 
+      #micButton {
+        position: fixed;
+        bottom: 28px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 12;
+        width: 72px;
+        height: 72px;
+        padding: 0;
+        border-radius: 50%;
+        font-size: 13px;
+        letter-spacing: 0.02em;
+        background: rgba(255,255,255,0.14);
+        border: 2px solid rgba(255,255,255,0.22);
+      }
+      #micButton.talking {
+        background: #e53935;
+        border-color: #ff8a80;
+        box-shadow: 0 0 0 6px rgba(229, 57, 53, 0.28);
+      }
+
       /* Legacy HUD - hidden by default, enable via ?debug=hud */
       #hud {
         position: fixed; left: 12px; right: 12px; bottom: 18px;
@@ -87,13 +108,15 @@
     <button id="arButton" class="secondary hit">Enter AR</button>
 
     <div id="overlay">
+      <button id="micButton" class="hit" type="button" aria-label="Hold to talk">Hold</button>
       <!-- Legacy HUD - hidden by default -->
       <div id="hud">
         <div class="panel hit">
           <h1>Perception CAD</h1>
           <p class="status" id="status">Initializing Percy...</p>
           <p class="hint">
-            Say <b>"Hey Percy"</b> then speak your command. Press <b>M</b> to mute/unmute.
+            <b>Hold</b> left trigger / pinch / Space / mic to talk. Release to send.
+            Right pinch the model to move it. <b>M</b> mutes.
             <br>Try: "build me a star", "make it yellow", "bigger"
           </p>
         </div>

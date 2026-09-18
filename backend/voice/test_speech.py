@@ -72,10 +72,10 @@ NORMALIZATION_CASES = {
     "mercy build me a box": "Percy, build me a box",
     "Merci, make it bigger": "Percy, make it bigger",
     "merci make a ring": "Percy, make a ring",
-    "See, create a cylinder": "Percy, create a cylinder",
-    "see make it yellow": "Percy, make it yellow",
-    "I see, build a sphere": "Percy, build a sphere",
-    "i see make it gold": "Percy, make it gold",
+    "See, create a cylinder": "See, create a cylinder",
+    "see make it yellow": "see make it yellow",
+    "I see, build a sphere": "I see, build a sphere",
+    "i see make it gold": "i see make it gold",
     "PC, design a gear": "Percy, design a gear",
     "pc build me a mug": "Percy, build me a mug",
     "purse, make it thicker": "Percy, make it thicker",
@@ -88,19 +88,19 @@ NORMALIZATION_CASES = {
     # With punctuation variations
     "Mercy. Build me a box": "Percy, Build me a box",
     "mercy, build a cylinder": "Percy, build a cylinder",
-    "See. Make it red": "Percy, Make it red",
+    "See. Make it red": "See. Make it red",
     
     # Wake word only (no command)
     "Mercy": "Percy",
     "mercy": "Percy",
     "Percy": "Percy",
     "percy": "Percy",
-    "See": "Percy",
-    "I see": "Percy",
+    "See": "See",
+    "I see": "I see",
     
     # Leading whitespace
     "  Mercy, build a box": "Percy, build a box",
-    " see make it gold": "Percy, make it gold",
+    " see make it gold": " see make it gold",
     
     # Should NOT be normalized (word in middle/end or not a match)
     "Build me a mercy box": "Build me a mercy box",
@@ -271,13 +271,12 @@ async def test_elevenlabs_keyterms_no_throw():
             call_args = mock_client.post.call_args
             if call_args:
                 call_kwargs = call_args.kwargs if call_args.kwargs else {}
-                data = call_kwargs.get("data", [])
+                files = call_kwargs.get("files", [])
                 
-                # Check if keyterms are in the data
                 keyterms_found = any(
                     (isinstance(item, tuple) and item[0] == "keyterms")
-                    for item in data
-                ) if isinstance(data, list) else False
+                    for item in files
+                ) if isinstance(files, list) else False
                 
                 if keyterms_found:
                     print("  ✓ Keyterms included in request data")

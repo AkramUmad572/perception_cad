@@ -19,8 +19,10 @@ action path — they produce a new CadQuery script and execute it through the sa
 This is intentional: any structural change to the model requires full script execution
 and MUST return rebuilt=True with fresh model_id/glb_url on success.
 
-See ai/intent.py _check_scale_modify() for scale fast-path that returns Intent(action="generate").
-Complex geometry edits go through LLM codegen and also return action="generate".
+See apply_intent action="generate": size/geometry follow-ups produce a new CadQuery
+script via Gemini (with last_script + last_summary) and execute it in the sandbox.
+There is no regex that rewrites every number in the script (that used to break
+n_teeth / range() on gears).
 """
 
 import sys
@@ -41,6 +43,9 @@ def _mock_settings():
     settings.glb_dir = Path("/tmp/test_glb")
     settings.audio_dir = Path("/tmp/test_audio")
     settings.elevenlabs_api_key = None  # Disable TTS
+    settings.meshy_api_key = ""
+    settings.nvidia_api_key = ""
+    settings.three_ws_enabled = True
     return settings
 
 
@@ -94,6 +99,10 @@ async def test_color_change_with_script_returns_new_model():
     
     if result.action != "set_material":
         errors.append(f"action should be 'set_material', got {result.action!r}")
+
+    flatten = mock_exec.call_args.kwargs.get("flatten_color")
+    if flatten is not True:
+        errors.append(f"set_material must pass flatten_color=True, got {flatten!r}")
     
     if errors:
         print("  ✗ FAILED:")
@@ -861,8 +870,194 @@ async def test_no_collapse_to_templates():
 
 
 # ============================================================================
-# Run All Tests
+# Test 11: Generate bakes named color from transcript and stores last_summary
 # ============================================================================
+
+async def test_generate_bakes_named_color_and_summary():
+    """Named color in the utterance is applied before sandbox exec; summary is stored."""
+    print("\n=== Test: Generate bakes named color + last_summary ===")
+
+    session = SessionState(
+        session_id="test",
+        model_id="old_model",
+        glb_url="/media/glb/old_model.glb",
+        color="#C0C0C0",
+        last_summary=None,
+    )
+    intent = Intent(
+        action="generate",
+        script='import cadquery as cq\nresult = cq.Workplane("XY").box(20, 20, 10)',
+        reply="Built a yellow mug.",
+    )
+    settings = _mock_settings()
+
+    with patch("app.pipeline._execute_with_retry") as mock_exec:
+        mock_exec.return_value = (True, "mug_yellow", None)
+        with patch("app.pipeline.synthesize_speech") as mock_tts:
+            mock_tts.return_value = (None, 0.0)
+            with patch("app.pipeline.save_session"):
+                result = await apply_intent(
+                    intent,
+                    session,
+                    settings,
+                    transcript="build me a yellow mug",
+                )
+
+    errors = []
+    if session.color != "#FFD700":
+        errors.append(f"session.color should be #FFD700, got {session.color!r}")
+    if session.last_summary != "Built a yellow mug.":
+        errors.append(f"last_summary should be stored, got {session.last_summary!r}")
+    if result.color != "#FFD700":
+        errors.append(f"response color should be #FFD700, got {result.color!r}")
+    if not result.rebuilt:
+        errors.append("rebuilt should be True")
+    flatten = mock_exec.call_args.kwargs.get("flatten_color")
+    if flatten is not False:
+        errors.append(f"generate must pass flatten_color=False, got {flatten!r}")
+
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] named color baked and last_summary stored")
+    return 1, 0
+
+
+async def test_mesh_generate_skips_sandbox_and_sets_session():
+    """backend=mesh must call Meshy, not CadQuery, and keep last_script unset."""
+    print("\n=== Test: Mesh generate skips sandbox ===")
+    session = SessionState(
+        session_id="test",
+        last_script='import cadquery as cq\nresult = cq.Workplane("XY").box(10,10,5)',
+        last_backend="cad",
+        model_id="old",
+        glb_url="/media/glb/old.glb",
+    )
+    intent = Intent(
+        action="generate",
+        backend="mesh",
+        mesh_prompt="a yellow electric mouse, full body 3d model",
+        script=None,
+        reply="Here's that sculpt.",
+    )
+    settings = _mock_settings()
+    settings.meshy_api_key = "test-key"
+
+    with patch("app.pipeline._execute_with_retry") as mock_cad:
+        with patch("app.pipeline.generate_mesh_glb") as mock_mesh:
+            mock_mesh.return_value = {
+                "ok": True,
+                "model_id": "mesh123abc",
+                "glb_path": "/tmp/test_glb/mesh123abc.glb",
+                "exec_ms": 1200,
+                "textured": True,
+            }
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+
+    errors = []
+    if mock_cad.called:
+        errors.append("CadQuery sandbox must not run for mesh generate")
+    if not mock_mesh.called:
+        errors.append("generate_mesh_glb was not called")
+    if session.last_script is not None:
+        errors.append("last_script must be cleared on mesh sessions")
+    if session.last_backend != "mesh":
+        errors.append(f"last_backend should be mesh, got {session.last_backend}")
+    if session.last_mesh_prompt != intent.mesh_prompt:
+        errors.append("last_mesh_prompt should be stored")
+    if not result.textured or result.backend != "mesh":
+        errors.append(f"response flags textured/backend wrong: {result.textured} {result.backend}")
+    if not result.rebuilt or result.model_id != "mesh123abc":
+        errors.append("mesh generate should rebuild with new model_id")
+
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] mesh generate skipped sandbox")
+    return 1, 0
+
+
+async def test_mesh_without_meshy_still_runs_factory():
+    """No Meshy key still sculpts via three.ws; never falls back to CadQuery."""
+    print("\n=== Test: Mesh without Meshy still uses factory ===")
+    session = SessionState(session_id="test")
+    intent = Intent(
+        action="generate",
+        backend="mesh",
+        mesh_prompt="a dragon",
+        script='import cadquery as cq\nresult = cq.Workplane("XY").box(10,10,5)',
+        reply="Here's that sculpt.",
+    )
+    settings = _mock_settings()
+    with patch("app.pipeline._execute_with_retry") as mock_cad:
+        with patch("app.pipeline.generate_mesh_glb") as mock_mesh:
+            mock_mesh.return_value = {
+                "ok": True,
+                "model_id": "free123",
+                "glb_path": "/tmp/test_glb/free123.glb",
+                "exec_ms": 800,
+                "textured": True,
+                "provider": "three_ws",
+            }
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+    errors = []
+    if mock_cad.called:
+        errors.append("must not call CadQuery")
+    if not mock_mesh.called:
+        errors.append("factory should run without a Meshy key")
+    if not result.rebuilt or result.backend != "mesh":
+        errors.append(f"expected mesh rebuild, got {result.action} rebuilt={result.rebuilt}")
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] three.ws factory runs without Meshy")
+    return 1, 0
+
+
+async def test_cad_generate_still_uses_sandbox():
+    """CAD generate must not call Meshy."""
+    print("\n=== Test: CAD generate still uses sandbox ===")
+    session = SessionState(session_id="test")
+    intent = Intent(
+        action="generate",
+        backend="cad",
+        script='import cadquery as cq\nresult = cq.Workplane("XY").box(10,10,5)',
+        reply="Built a box.",
+    )
+    settings = _mock_settings()
+    with patch("app.pipeline._execute_with_retry") as mock_cad:
+        mock_cad.return_value = (True, "cadbox1", None)
+        with patch("app.pipeline.generate_mesh_glb") as mock_mesh:
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+    errors = []
+    if mock_mesh.called:
+        errors.append("Meshy must not run for CAD generate")
+    if not mock_cad.called:
+        errors.append("sandbox should run")
+    if result.textured or result.backend != "cad":
+        errors.append(f"CAD response flags wrong: textured={result.textured} backend={result.backend}")
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] CAD generate uses sandbox only")
+    return 1, 0
 
 def run_all_tests():
     """Run all pipeline regression tests."""
@@ -928,6 +1123,22 @@ def run_all_tests():
         
         # Async test: no collapse to templates
         p, f = loop.run_until_complete(test_no_collapse_to_templates())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_generate_bakes_named_color_and_summary())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_mesh_generate_skips_sandbox_and_sets_session())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_mesh_without_meshy_still_runs_factory())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_cad_generate_still_uses_sandbox())
         total_pass += p
         total_fail += f
         

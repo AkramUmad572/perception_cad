@@ -6,21 +6,75 @@ import logging
 import time
 from typing import Any
 
+from ai.intent import extract_named_color
 from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState
 from app.session import save_session
 from cad import DEFAULTS
 from cad.sandbox import execute_cadquery_script
 from cad.builder import merge_params, build_model
+from mesh.factory import (
+    generate_mesh_glb,
+    generate_mesh_glb_from_image,
+    mesh_ready,
+)
+from photos.drive import download_file, list_images
+from photos.search import find_photos
+from photos.stage import stage_photo
 from voice.speech import synthesize_speech
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 
+# CadQuery models carry real millimetre dimensions, so they are shown life size.
+# The clamps only stop a stray script from producing something invisible or
+# room-filling in AR.
+CAD_MIN_M = 0.04
+CAD_MAX_M = 1.00
+# Mesh output is unit-normalised, so a sculpt has no real size of its own.
+MESH_DEFAULT_M = 0.20
+SIZE_MIN_M = 0.03
+SIZE_MAX_M = 2.00
+
 
 def _glb_url(settings: Settings, model_id: str) -> str:
     return f"/media/glb/{model_id}.glb"
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
+
+
+def _cad_size_m(settings: Settings, model_id: str) -> float:
+    """
+    Longest real dimension of a CadQuery GLB, in metres.
+
+    The sandbox already converts mm to metres on export, so this reads straight
+    off the bounds — the script's real dimensions survive into the headset.
+    """
+    try:
+        import trimesh
+
+        scene = trimesh.load(str(settings.glb_dir / f"{model_id}.glb"))
+        lo, hi = scene.bounds
+        longest_m = float(max(hi - lo))
+    except Exception as exc:
+        logger.info("Could not measure %s: %s", model_id, exc)
+        return MESH_DEFAULT_M
+    if longest_m <= 0:
+        return MESH_DEFAULT_M
+    return _clamp(longest_m, CAD_MIN_M, CAD_MAX_M)
+
+
+def _mesh_size_m(size_mm: float | None) -> float:
+    if not size_mm or size_mm <= 0:
+        return MESH_DEFAULT_M
+    return _clamp(float(size_mm) / 1000.0, SIZE_MIN_M, SIZE_MAX_M)
+
+
+def _display_size_m(session: SessionState) -> float:
+    return _clamp(session.base_size_m * session.scale, SIZE_MIN_M, SIZE_MAX_M)
 
 
 async def _execute_with_retry(
@@ -29,6 +83,7 @@ async def _execute_with_retry(
     session: SessionState,
     settings: Settings,
     latency: dict[str, float],
+    flatten_color: bool = True,
 ) -> tuple[bool, str | None, str | None]:
     """
     Execute CadQuery script in sandbox with retry loop on failure.
@@ -48,8 +103,9 @@ async def _execute_with_retry(
         result = execute_cadquery_script(
             script=current_script,
             output_dir=settings.glb_dir,
-            timeout=30.0,
+            timeout=45.0,
             color=color,
+            flatten_color=flatten_color,
         )
         latency[f"cad_ms_attempt_{attempt}"] = result.get("exec_ms", 0)
 
@@ -60,6 +116,9 @@ async def _execute_with_retry(
             session.model_id = result["model_id"]
             session.glb_url = _glb_url(settings, result["model_id"])
             session.last_script = current_script
+            session.last_backend = "cad"
+            session.last_mesh_prompt = None
+            session.base_size_m = _cad_size_m(settings, result["model_id"])
             save_session(session)
             return True, result["model_id"], None
 
@@ -88,6 +147,38 @@ async def _execute_with_retry(
     return False, None, last_error
 
 
+async def _execute_mesh(
+    prompt: str,
+    session: SessionState,
+    settings: Settings,
+    latency: dict[str, float],
+    size_mm: float | None = None,
+) -> tuple[bool, str | None, str | None, bool]:
+    """Text-to-3D via three.ws / NVIDIA / Meshy. Never falls back to CadQuery."""
+    result = await generate_mesh_glb(
+        prompt=prompt,
+        output_dir=settings.glb_dir,
+        meshy_api_key=settings.meshy_api_key or "",
+        nvidia_api_key=getattr(settings, "nvidia_api_key", "") or "",
+        three_ws=bool(getattr(settings, "three_ws_enabled", True)),
+        timeout_s=150.0,
+    )
+    latency["mesh_ms"] = result.get("exec_ms", 0)
+    if not result.get("ok"):
+        return False, None, result.get("error", "Mesh generation failed"), False
+
+    session.template = None
+    session.params = {}
+    session.model_id = result["model_id"]
+    session.glb_url = _glb_url(settings, result["model_id"])
+    session.last_script = None
+    session.last_backend = "mesh"
+    session.last_mesh_prompt = prompt
+    session.base_size_m = _mesh_size_m(size_mm)
+    save_session(session)
+    return True, result["model_id"], None, bool(result.get("textured", True))
+
+
 async def apply_intent(
     intent: Intent,
     session: SessionState,
@@ -99,8 +190,9 @@ async def apply_intent(
     Apply an Intent to session state.
     
     Handles:
-    - generate: Execute CadQuery script via sandbox (with retry loop)
-    - set_material: Change color AND ALWAYS rebuild to return fresh model_id/glb_url
+    - generate + backend=mesh: Meshy text-to-3D (no CadQuery)
+    - generate + backend=cad: CadQuery script via sandbox (with retry loop)
+    - set_material: CAD rebuild, or mesh re-gen with color in the prompt
     - create/modify: Legacy template path (kept for backward compat)
     - clarify/noop: No CAD action
     
@@ -113,22 +205,132 @@ async def apply_intent(
     action = intent.action
     error_msg = None
     result_model_id: str | None = None
+    textured = False
+    response_backend = intent.backend or session.last_backend or "cad"
+    candidates: list[dict] = []
 
-    if action == "generate":
+    if action == "find_photos":
+        response_backend = "mesh"
+        try:
+            files = await list_images(settings)
+        except Exception as exc:
+            logger.warning("Drive list failed: %s", exc)
+            error_msg = str(exc)
+            intent.reply = "I couldn't reach your photos."
+            action = "clarify"
+            files = []
+        if files:
+            query = (intent.photo_query or "").strip() or (transcript or "").strip()
+            staged: list[dict] = []
+            thumbs: dict[str, bytes] = {}
+            for item in files:
+                try:
+                    raw, mime = await download_file(item["id"], settings)
+                except Exception as exc:
+                    logger.warning("Drive download %s failed: %s", item.get("id"), exc)
+                    continue
+                thumbs[item["id"]] = raw[: min(len(raw), 400_000)]
+                info = stage_photo(
+                    raw,
+                    settings,
+                    mime=mime,
+                    name=item.get("name") or "",
+                    file_id=item["id"],
+                )
+                staged.append(
+                    {
+                        "id": item["id"],
+                        "name": item.get("name") or "photo",
+                        "preview_url": info["preview_url"],
+                        "image_url": info["preview_url"],
+                        "build_url": info["build_url"],
+                    }
+                )
+            matches = await find_photos(query, files, settings, thumbs)
+            match_ids = {m["id"] for m in matches}
+            candidates = [s for s in staged if s["id"] in match_ids] or staged
+            session.last_photos = candidates
+            save_session(session)
+            n = len(candidates)
+            if n == 0:
+                intent.reply = "I didn't find that in your photos."
+                action = "clarify"
+            elif n == 1:
+                intent.reply = "Found it. Pinch to confirm."
+            else:
+                intent.reply = f"Found {n}. Pinch to pick one."
+
+    elif action == "generate" and (intent.backend or "cad") == "mesh":
+        prompt = (intent.mesh_prompt or "").strip()
+        if not prompt:
+            intent.reply = "No mesh prompt was generated."
+            action = "clarify"
+            response_backend = "mesh"
+        elif not mesh_ready(settings):
+            intent.reply = (
+                "Mesh generation isn't configured. "
+                "three.ws should work with no key; or set NVIDIA_API_KEY / MESHY_API_KEY."
+            )
+            action = "clarify"
+            response_backend = "mesh"
+        else:
+            session.scale = 1.0
+            success, model_id, error, _mesh_textured = await _execute_mesh(
+                prompt, session, settings, latency, size_mm=intent.size_mm
+            )
+            if success:
+                rebuilt = True
+                result_model_id = model_id
+                textured = True
+                response_backend = "mesh"
+                session.last_summary = intent.reply
+                save_session(session)
+            else:
+                error_msg = error
+                intent.reply = f"Sculpt failed: {error}"
+                action = "clarify"
+                response_backend = "mesh"
+
+    elif action == "set_scale":
+        # Resizing a sculpt is a display change, not a reason to spend 90s
+        # rebuilding a model that would come back looking different anyway.
+        if not session.model_id:
+            error_msg = "No model to resize. Build something first."
+            intent.reply = error_msg
+            action = "clarify"
+        else:
+            factor = float(intent.params.get("factor") or 1.0)
+            session.scale = _clamp(
+                session.scale * factor, SIZE_MIN_M / session.base_size_m,
+                SIZE_MAX_M / session.base_size_m,
+            )
+            response_backend = session.last_backend
+            save_session(session)
+
+    elif action == "generate":
         if not intent.script:
             intent.reply = "No code was generated."
             action = "clarify"
         else:
+            session.scale = 1.0
+            named = extract_named_color(transcript or "")
+            if named:
+                session.color = named
+                session.params["color"] = named
             success, model_id, error = await _execute_with_retry(
                 script=intent.script,
                 original_text=transcript or "",
                 session=session,
                 settings=settings,
                 latency=latency,
+                flatten_color=False,
             )
             if success:
                 rebuilt = True
                 result_model_id = model_id
+                response_backend = "cad"
+                session.last_summary = intent.reply
+                save_session(session)
             else:
                 error_msg = error
                 intent.reply = f"Build failed: {error}"
@@ -149,6 +351,8 @@ async def apply_intent(
             if success:
                 rebuilt = True
                 result_model_id = model_id
+                session.last_summary = intent.reply
+                save_session(session)
             else:
                 error_msg = error
                 intent.reply = f"Script failed: {error}"
@@ -168,6 +372,8 @@ async def apply_intent(
                 session.model_id = model_id
                 session.glb_url = _glb_url(settings, model_id)
                 session.last_script = None
+                session.last_backend = "cad"
+                session.last_mesh_prompt = None
                 rebuilt = True
                 result_model_id = model_id
                 save_session(session)
@@ -206,12 +412,36 @@ async def apply_intent(
         color = str(intent.params.get("color", session.color))
         session.color = color
         session.params["color"] = color
-        
-        # CRITICAL: Always rebuild to return a new model_id/glb_url.
-        # A "successful" set_material with no new asset is a client no-op.
+
         rebuild_attempted = False
-        
-        if session.last_script:
+
+        if session.last_backend == "mesh" and session.last_mesh_prompt:
+            rebuild_attempted = True
+            if not mesh_ready(settings):
+                error_msg = "Mesh generation isn't configured."
+                intent.reply = (
+                    "Mesh generation isn't configured. "
+                    "three.ws should work with no key; or set NVIDIA_API_KEY / MESHY_API_KEY."
+                )
+                action = "clarify"
+                response_backend = "mesh"
+            else:
+                prompt = f"{session.last_mesh_prompt}, overall color {color}"
+                success, model_id, error, _tex = await _execute_mesh(
+                    prompt, session, settings, latency
+                )
+                if success:
+                    rebuilt = True
+                    result_model_id = model_id
+                    textured = True
+                    response_backend = "mesh"
+                    session.color = color
+                    session.params["color"] = color
+                else:
+                    error_msg = f"Color change failed: {error}"
+                    intent.reply = f"Couldn't apply color: {error}"
+                    response_backend = "mesh"
+        elif session.last_script:
             rebuild_attempted = True
             success, model_id, error = await _execute_with_retry(
                 script=session.last_script,
@@ -219,12 +449,13 @@ async def apply_intent(
                 session=session,
                 settings=settings,
                 latency=latency,
+                flatten_color=True,
             )
             if success:
                 rebuilt = True
                 result_model_id = model_id
+                response_backend = "cad"
             else:
-                # Color change requested but rebuild failed - this is an error
                 error_msg = f"Color change failed: {error}"
                 intent.reply = f"Couldn't apply color: {error}"
         elif session.template and session.template in DEFAULTS:
@@ -235,18 +466,19 @@ async def apply_intent(
                 latency["cad_ms"] = build_ms
                 session.model_id = model_id
                 session.glb_url = _glb_url(settings, model_id)
+                session.last_backend = "cad"
                 rebuilt = True
                 result_model_id = model_id
+                response_backend = "cad"
             except Exception as e:
                 logger.warning("Rebuild for color failed: %s", e)
                 error_msg = f"Color change failed: {e}"
                 intent.reply = f"Couldn't apply color: {e}"
-        
+
         if not rebuild_attempted:
-            # No script or template to rebuild - cannot apply color to nothing
             error_msg = "No model to apply color to. Build something first."
             intent.reply = error_msg
-        
+
         save_session(session)
 
     t0 = time.perf_counter()
@@ -270,6 +502,150 @@ async def apply_intent(
         session=session,
         latency_ms=latency,
         error=error_msg,
+        textured=textured,
+        backend=response_backend,
+        display_size_m=_display_size_m(session),
+        candidates=candidates if action == "find_photos" else [],
+    )
+
+
+async def build_from_image(
+    image_url: str,
+    session: SessionState,
+    settings: Settings,
+    prompt: str = "",
+    speak: bool = True,
+    quality: str = "high",
+) -> CommandResponse:
+    """Image-to-3D: a reference photo beats describing the object in words."""
+    latency: dict[str, float] = {}
+    t0 = time.perf_counter()
+
+    result = await generate_mesh_glb_from_image(
+        image_url, settings.glb_dir, prompt=prompt, quality=quality
+    )
+    latency["mesh_ms"] = result.get("exec_ms", (time.perf_counter() - t0) * 1000)
+
+    if not result.get("ok"):
+        error = str(result.get("error") or "Image-to-3D failed.")
+        reply = "I couldn't build that from the photo."
+        audio_url, _ = await synthesize_speech(reply, settings) if speak else (None, 0)
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            latency_ms=latency,
+            error=error,
+            backend="mesh",
+            reply_audio_url=audio_url,
+        )
+
+    session.template = None
+    session.params = {}
+    session.model_id = result["model_id"]
+    session.glb_url = _glb_url(settings, result["model_id"])
+    session.last_script = None
+    session.last_backend = "mesh"
+    session.last_mesh_prompt = prompt or session.last_mesh_prompt
+    session.base_size_m = MESH_DEFAULT_M
+    session.scale = 1.0
+    save_session(session)
+
+    reply = "Built that from your photo."
+    audio_url, tts_ms = await synthesize_speech(reply, settings) if speak else (None, 0)
+    latency["tts_ms"] = tts_ms
+
+    return CommandResponse(
+        ok=True,
+        reply=reply,
+        action="generate",
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=result["model_id"],
+        reply_audio_url=audio_url,
+        session=session,
+        latency_ms=latency,
+        textured=bool(result.get("textured", True)),
+        backend="mesh",
+        display_size_m=_display_size_m(session),
+    )
+
+
+async def build_chosen_photo(
+    file_id: str,
+    session: SessionState,
+    settings: Settings,
+) -> CommandResponse:
+    """Sculpt the Drive photo the user pinched in the picker."""
+    chosen = next((p for p in session.last_photos if p.get("id") == file_id), None)
+    if not chosen:
+        reply = "I don't have that photo anymore. Ask me to find it again."
+        audio_url, _ = await synthesize_speech(reply, settings)
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            reply_audio_url=audio_url,
+            backend="mesh",
+        )
+
+    base = settings.public_base_url.rstrip("/")
+    if base.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
+        reply = "Image-to-3D needs the public tunnel running."
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            error=f"PUBLIC_BASE_URL is {base}",
+            backend="mesh",
+        )
+
+    prompt = chosen.get("name") or ""
+    return await build_from_image(
+        chosen["build_url"], session, settings, prompt=prompt, quality="high"
+    )
+
+
+def _spoken_photo_name(chosen: dict) -> str:
+    raw = (chosen.get("name") or "this").strip()
+    stem = raw.rsplit(".", 1)[0] if "." in raw else raw
+    label = stem.replace("_", " ").replace("-", " ").strip()
+    return label or "this"
+
+
+async def confirm_chosen_photo(
+    file_id: str,
+    session: SessionState,
+    settings: Settings,
+) -> CommandResponse:
+    """Spoken confirmation the moment the user pinches — before the long sculpt."""
+    chosen = next((p for p in session.last_photos if p.get("id") == file_id), None)
+    if not chosen:
+        reply = "I don't have that photo anymore. Ask me to find it again."
+        audio_url, _ = await synthesize_speech(reply, settings)
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            reply_audio_url=audio_url,
+            backend="mesh",
+        )
+    label = _spoken_photo_name(chosen)
+    reply = f"Sounds good. Building this image of {label}."
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    return CommandResponse(
+        ok=True,
+        reply=reply,
+        action="confirm_photo",
+        session=session,
+        reply_audio_url=audio_url,
+        backend="mesh",
+        latency_ms={"tts_ms": tts_ms},
     )
 
 
@@ -307,6 +683,8 @@ async def execute_script_direct(
             reply_audio_url=None,
             session=session,
             latency_ms=latency,
+            textured=False,
+            backend="cad",
         )
     else:
         return CommandResponse(

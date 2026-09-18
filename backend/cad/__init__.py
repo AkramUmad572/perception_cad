@@ -23,7 +23,7 @@ Also available as:
     from cad.sandbox import execute_script  # alias
     from cad.sandbox import execute_cadquery  # alias
 
-Flow: wake → listen → Gemini codegen → execute_cadquery_script → retry on failure → GLB
+Flow: hold-to-talk → Gemini codegen → execute_cadquery_script → retry on failure → GLB
 """
 
 from cad.sandbox import (

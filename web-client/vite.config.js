@@ -1,10 +1,14 @@
 import { defineConfig } from "vite";
-import basicSsl from "@vitejs/plugin-basic-ssl";
+import { iwsdkDev } from "@iwsdk/vite-plugin-dev";
 
-// Default: HTTP so Cursor/Chrome on localhost works (localhost is a secure context for WebXR).
-// Quest on LAN needs HTTPS: npm run dev:https → open https://YOUR_LAN_IP:5173 and accept the cert.
-const useHttps = process.env.CAD_HTTPS === "1";
-
+/**
+ * IWSDK-style desktop testing (Meta recommended WebXR path):
+ * - HTTPS for Quest + secure context
+ * - IWER Quest 3 emulator on localhost only (not on LAN headset IP)
+ * - Managed Playwright window in collaborate mode (like hologram / iwsdk dev up)
+ *
+ * Docs: https://developers.meta.com/horizon/documentation/web/webxr-overview/
+ */
 const proxyOpts = {
   target: "http://127.0.0.1:8000",
   changeOrigin: true,
@@ -14,7 +18,21 @@ const proxyOpts = {
 };
 
 export default defineConfig({
-  plugins: useHttps ? [basicSsl()] : [],
+  plugins: [
+    iwsdkDev({
+      emulator: {
+        device: "metaQuest3",
+        environment: "living_room",
+        activation: "localhost",
+        userAgentException: /OculusBrowser/,
+      },
+      ai: {
+        mode: "collaborate",
+      },
+      https: true,
+      verbose: true,
+    }),
+  ],
   server: {
     host: true,
     port: 5173,
@@ -22,6 +40,12 @@ export default defineConfig({
       "/api": proxyOpts,
       "/media": proxyOpts,
     },
+  },
+  resolve: {
+    // Let @iwsdk use its own three alias; app imports stay on package three.
+  },
+  optimizeDeps: {
+    exclude: ["@iwsdk/core"],
   },
   build: {
     outDir: "dist",
