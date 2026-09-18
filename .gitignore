@@ -4,8 +4,14 @@ __pycache__/
 .DS_Store
 backend/storage/glb/*
 backend/storage/audio/*
+backend/storage/ref/*
+backend/storage/sessions.json
 !backend/storage/glb/.gitkeep
 !backend/storage/audio/.gitkeep
+!backend/storage/ref/.gitkeep
 web-client/node_modules/
 web-client/dist/
+web-client/.iwsdk/
+backend/uvicorn.out.log
+backend/uvicorn.err.log
 .conda/

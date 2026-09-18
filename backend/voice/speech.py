@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 
@@ -12,21 +13,74 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
+
+PERCY_ALIASES = re.compile(
+    # Optional leftover wake names — not "see" / "i see" (real commands can start that way).
+    r"^\s*(?:pursee|persey|piercy|mercy|merci|percy|perce|purse|pc)[,.\s]*",
+    re.IGNORECASE,
+)
+
+HEY_PERCY_ALIASES = re.compile(
+    r"^\s*(?:"
+    r"hey\s+(?:percy|mercy|merce|merci|pursey|pursee|purse|persey|piercy|see|perce|pc)|"
+    r"a\s+(?:mercy|percy|merce|pursey)"
+    r")[,.\s]*",
+    re.IGNORECASE,
+)
+
+
+def normalize_wake_word(transcript: str) -> str:
+    """
+    Normalize common STT misrecognitions of wake words at start of utterance.
+    
+    'Hey Percy' variants (canonical wake phrase):
+      hey mercy, hey see, hey merce, hey pursey, a mercy → hey percy
+    
+    Legacy leftover wake names (still stripped if STT prefixes them):
+      Mercy, Merci, PC, purse, perce, persey, piercy → Percy
+    Bare "see" / "I see" are left alone so they are not treated as a wake word.
+    """
+    match = HEY_PERCY_ALIASES.match(transcript)
+    if match:
+        remainder = transcript[match.end():].strip()
+        if remainder:
+            return f"hey percy, {remainder}"
+        return "hey percy"
+    
+    match = PERCY_ALIASES.match(transcript)
+    if match:
+        remainder = transcript[match.end():].strip()
+        if remainder:
+            return f"Percy, {remainder}"
+        return "Percy"
+    return transcript
+
 CAD_KEYTERMS = [
-    "ring",
-    "box",
-    "cube",
-    "cylinder",
-    "tube",
+    # Wake word and common misrecognitions
+    "Percy",
+    "percy",
+    # Generic CAD/modeling verbs
     "build",
     "make",
-    "yellow",
+    "create",
+    "design",
+    # Dimension/size words
     "thicker",
     "thinner",
     "bigger",
     "smaller",
+    "taller",
+    "shorter",
+    "wider",
     "diameter",
     "millimeters",
+    # Colors
+    "yellow",
+    "blue",
+    "red",
+    "green",
+    "gold",
+    "golden",
 ]
 
 
@@ -56,32 +110,29 @@ async def _elevenlabs_stt(
             # Try with keyterms, then without if rejected
             for with_keyterms in (True, False):
                 try:
-                    files = {"file": (name, audio_bytes, mime)}
-                    data: dict[str, str] | list[tuple[str, str]]
+                    # Put fields in `files` (not `data`) so AsyncClient does not
+                    # try a sync multipart encode (httpx: "sync request with AsyncClient").
+                    files: list[tuple[str, tuple]] = [
+                        ("file", (name, audio_bytes, mime)),
+                        ("model_id", (None, model_id)),
+                        ("language_code", (None, "eng")),
+                        ("tag_audio_events", (None, "false")),
+                    ]
                     if with_keyterms:
-                        data = [
-                            ("model_id", model_id),
-                            ("language_code", "eng"),
-                            ("tag_audio_events", "false"),
-                        ] + [("keyterms", t) for t in CAD_KEYTERMS]
-                    else:
-                        data = {
-                            "model_id": model_id,
-                            "language_code": "eng",
-                            "tag_audio_events": "false",
-                        }
+                        for term in CAD_KEYTERMS:
+                            files.append(("keyterms", (None, term)))
 
                     resp = await client.post(
                         "https://api.elevenlabs.io/v1/speech-to-text",
                         headers={"xi-api-key": settings.elevenlabs_api_key},
                         files=files,
-                        data=data,
                     )
                     if resp.status_code == 422 and with_keyterms:
                         logger.info("Scribe rejected keyterms; retrying plain")
                         continue
                     resp.raise_for_status()
                     transcript = (resp.json().get("text") or "").strip()
+                    transcript = normalize_wake_word(transcript)
                     logger.info("STT(%s): %r", model_id, transcript)
                     return transcript
                 except Exception as exc:
@@ -128,6 +179,7 @@ async def transcribe_audio(
                 .get("transcript", "")
                 .strip()
             )
+            transcript = normalize_wake_word(transcript)
             logger.info("STT(deepgram): %r", transcript)
             return transcript, (time.perf_counter() - t0) * 1000
 
@@ -150,6 +202,7 @@ async def transcribe_audio(
                         ),
                     )
                 transcript = (result.text or "").strip()
+                transcript = normalize_wake_word(transcript)
                 logger.info("STT(whisper): %r", transcript)
                 return transcript, (time.perf_counter() - t0) * 1000
             finally:

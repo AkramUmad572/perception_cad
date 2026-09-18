@@ -31,8 +31,20 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
 
+    # Meshy (paid) or NVIDIA TRELLIS (free key) or three.ws (keyless draft).
+    meshy_api_key: str = ""
+    nvidia_api_key: str = ""
+    three_ws_enabled: bool = True
+
+    # Public Drive folder of demo photos. Empty = photo search is off.
+    google_drive_api_key: str = ""
+    google_drive_folder_id: str = ""
+
     glb_dir: Path = STORAGE / "glb"
     audio_dir: Path = STORAGE / "audio"
+    # Reference photos for image-to-3D. three.ws fetches these by URL, so they
+    # have to be reachable from outside this machine.
+    ref_dir: Path = STORAGE / "ref"
     prefer_cadquery: bool = True
 
 
@@ -41,4 +53,5 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.glb_dir.mkdir(parents=True, exist_ok=True)
     settings.audio_dir.mkdir(parents=True, exist_ok=True)
+    settings.ref_dir.mkdir(parents=True, exist_ok=True)
     return settings
