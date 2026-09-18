@@ -68,6 +68,17 @@ else
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
 fi
 
+# Test 5: VAD timing tests (post-wake grace period)
+echo ""
+echo ">>> Running VAD Timing Tests..."
+echo ""
+if node web-client/src/test_vad_timing.js; then
+    echo "VAD timing tests: PASSED"
+else
+    echo "VAD timing tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+
 # Final summary
 echo ""
 echo "========================================"
