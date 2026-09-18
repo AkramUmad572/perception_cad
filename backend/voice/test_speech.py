@@ -21,6 +21,52 @@ from voice.speech import normalize_wake_word, CAD_KEYTERMS
 
 # Test cases for wake word normalization
 NORMALIZATION_CASES = {
+    # =========================================================================
+    # "Hey Percy" canonical wake phrase aliases (NEW)
+    # =========================================================================
+    
+    # "hey mercy" → "hey percy"
+    "hey mercy, build me a box": "hey percy, build me a box",
+    "hey mercy build me a ring": "hey percy, build me a ring",
+    "Hey Mercy, make it yellow": "hey percy, make it yellow",
+    "HEY MERCY, BUILD A CUBE": "hey percy, BUILD A CUBE",
+    
+    # "hey see" → "hey percy"
+    "hey see, build me a cylinder": "hey percy, build me a cylinder",
+    "hey see make it bigger": "hey percy, make it bigger",
+    
+    # "hey merce" → "hey percy"
+    "hey merce, build me a box": "hey percy, build me a box",
+    "hey merce make it gold": "hey percy, make it gold",
+    
+    # "hey pursey" → "hey percy"
+    "hey pursey, build me a ring": "hey percy, build me a ring",
+    "hey pursey make it thicker": "hey percy, make it thicker",
+    
+    # "a mercy" → "hey percy"
+    "a mercy, build me a box": "hey percy, build me a box",
+    "a mercy build me a ring": "hey percy, build me a ring",
+    "A Mercy, make it blue": "hey percy, make it blue",
+    
+    # Other "hey X" variants
+    "hey pursee, make it blue": "hey percy, make it blue",
+    "hey persey, build a cube": "hey percy, build a cube",
+    "hey piercy, make it red": "hey percy, make it red",
+    "hey perce, build me a gear": "hey percy, build me a gear",
+    "hey pc, design a ring": "hey percy, design a ring",
+    "hey merci, build a vase": "hey percy, build a vase",
+    "hey purse, make it thinner": "hey percy, make it thinner",
+    
+    # Wake phrase only (no command)
+    "hey percy": "hey percy",
+    "hey mercy": "hey percy",
+    "a mercy": "hey percy",
+    "Hey Percy": "hey percy",
+    
+    # =========================================================================
+    # Legacy single-word aliases (still supported)
+    # =========================================================================
+    
     # Direct matches at start of utterance
     "Mercy, build me a box": "Percy, build me a box",
     "mercy build me a box": "Percy, build me a box",

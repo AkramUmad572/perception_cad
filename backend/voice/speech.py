@@ -19,13 +19,32 @@ PERCY_ALIASES = re.compile(
     re.IGNORECASE,
 )
 
+HEY_PERCY_ALIASES = re.compile(
+    r"^\s*(?:"
+    r"hey\s+(?:percy|mercy|merce|merci|pursey|pursee|purse|persey|piercy|see|perce|pc)|"
+    r"a\s+(?:mercy|percy|merce|pursey)"
+    r")[,.\s]*",
+    re.IGNORECASE,
+)
+
 
 def normalize_wake_word(transcript: str) -> str:
     """
-    Normalize common STT misrecognitions of 'Percy' at start of utterance.
+    Normalize common STT misrecognitions of wake words at start of utterance.
     
-    Maps: Mercy, Merci, See, I see, PC, purse, perce, persey, piercy → Percy
+    'Hey Percy' variants (canonical wake phrase):
+      hey mercy, hey see, hey merce, hey pursey, a mercy → hey percy
+    
+    Legacy single-word aliases (still supported):
+      Mercy, Merci, See, I see, PC, purse, perce, persey, piercy → Percy
     """
+    match = HEY_PERCY_ALIASES.match(transcript)
+    if match:
+        remainder = transcript[match.end():].strip()
+        if remainder:
+            return f"hey percy, {remainder}"
+        return "hey percy"
+    
     match = PERCY_ALIASES.match(transcript)
     if match:
         remainder = transcript[match.end():].strip()

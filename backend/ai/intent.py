@@ -266,6 +266,14 @@ _STT_FIXES = [
     (r"\byello\b", "yellow"), (r"\bmellow\b", "yellow"),
 ]
 
+# "Hey Percy" wake phrase aliases (canonical)
+# Maps STT mishears: hey mercy, hey see, hey merce, hey pursey, a mercy → hey percy
+_HEY_PERCY_ALIASES = re.compile(
+    r"^(?:hey\s+(?:percy|mercy|merce|merci|pursey|pursee|purse|persey|piercy|see|perce|pc)|"
+    r"a\s+(?:mercy|percy|merce|pursey))[,.\s]*",
+    re.IGNORECASE,
+)
+
 # STT false wake-word patterns: "Mercy", "See", "I see" misheard before "Percy"
 # These appear at the start of transcripts as garbage prefixes.
 # We either normalize them to "Percy" (if followed by command) or strip them.
@@ -283,20 +291,34 @@ _WAKE_WORD_ALIASES = [
 
 def _normalize_wake_word(text: str) -> str:
     """
-    Normalize STT garbage that appears before the wake word "Percy".
+    Normalize STT garbage that appears before wake words.
     
-    Common STT mishearings:
+    "Hey Percy" (canonical wake phrase) mishearings:
+    - "hey mercy, build me a box" → "hey percy, build me a box"
+    - "hey see, make it yellow" → "hey percy, make it yellow"
+    - "a mercy build me a ring" → "hey percy, build me a ring"
+    
+    Legacy single-word mishearings:
     - "Mercy, can you build me a box" → "Percy, can you build me a box"
     - "See, can you make it yellow" → "can you make it yellow" (stripped)
     - "I see. Can you build a ring" → "Can you build a ring" (stripped)
     
     Strategy:
-    1. If text starts with "Mercy", replace with "Percy" (closest mishearing)
-    2. If text starts with "See," or "I see." followed by a command, strip the prefix
-    3. If "Percy Percy", dedupe to single "Percy"
+    1. If text starts with "hey percy" alias, normalize to "hey percy"
+    2. If text starts with "Mercy", replace with "Percy" (closest mishearing)
+    3. If text starts with "See," or "I see." followed by a command, strip the prefix
+    4. If "Percy Percy", dedupe to single "Percy"
     """
     t = text.strip()
     lower = t.lower()
+    
+    # "hey percy" aliases: hey mercy, hey see, hey merce, a mercy, etc.
+    match = _HEY_PERCY_ALIASES.match(t)
+    if match:
+        rest = t[match.end():].strip()
+        if rest:
+            return f"hey percy, {rest}"
+        return "hey percy"
     
     # "Mercy" → "Percy" (preserve case style if original was capitalized)
     if lower.startswith("mercy"):

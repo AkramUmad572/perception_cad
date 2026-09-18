@@ -25,6 +25,68 @@ from ai.intent import _normalize_transcript, _normalize_wake_word, _check_color_
 STT_WAKE_WORD_TESTS = [
     # (input, expected_output, description)
     
+    # =========================================================================
+    # "Hey Percy" canonical wake phrase aliases (NEW)
+    # =========================================================================
+    
+    # "hey mercy" → "hey percy"
+    ("hey mercy, build me a box", "hey percy, build me a box",
+     "hey mercy → hey percy with comma"),
+    ("hey mercy build me a ring", "hey percy, build me a ring",
+     "hey mercy → hey percy without comma"),
+    ("Hey Mercy, make it yellow", "hey percy, make it yellow",
+     "Hey Mercy capitalized → hey percy"),
+    
+    # "hey see" → "hey percy"
+    ("hey see, build me a cylinder", "hey percy, build me a cylinder",
+     "hey see → hey percy"),
+    ("hey see make it bigger", "hey percy, make it bigger",
+     "hey see without comma → hey percy"),
+    
+    # "hey merce" → "hey percy"
+    ("hey merce, build me a box", "hey percy, build me a box",
+     "hey merce → hey percy"),
+    ("hey merce make it gold", "hey percy, make it gold",
+     "hey merce without comma → hey percy"),
+    
+    # "hey pursey" → "hey percy"
+    ("hey pursey, build me a ring", "hey percy, build me a ring",
+     "hey pursey → hey percy"),
+    ("hey pursey make it thicker", "hey percy, make it thicker",
+     "hey pursey without comma → hey percy"),
+    
+    # "a mercy" → "hey percy"
+    ("a mercy, build me a box", "hey percy, build me a box",
+     "a mercy → hey percy with comma"),
+    ("a mercy build me a ring", "hey percy, build me a ring",
+     "a mercy → hey percy without comma"),
+    
+    # Other "hey X" variants
+    ("hey pursee, make it blue", "hey percy, make it blue",
+     "hey pursee → hey percy"),
+    ("hey persey, build a cube", "hey percy, build a cube",
+     "hey persey → hey percy"),
+    ("hey piercy, make it red", "hey percy, make it red",
+     "hey piercy → hey percy"),
+    ("hey perce, build me a gear", "hey percy, build me a gear",
+     "hey perce → hey percy"),
+    ("hey pc, design a ring", "hey percy, design a ring",
+     "hey pc → hey percy"),
+    ("hey merci, build a vase", "hey percy, build a vase",
+     "hey merci → hey percy"),
+    
+    # Wake phrase only (no command)
+    ("hey percy", "hey percy",
+     "hey percy alone unchanged"),
+    ("hey mercy", "hey percy",
+     "hey mercy alone → hey percy"),
+    ("a mercy", "hey percy",
+     "a mercy alone → hey percy"),
+    
+    # =========================================================================
+    # Legacy single-word aliases (still supported)
+    # =========================================================================
+    
     # "Mercy" → "Percy" normalization
     ("Mercy, can you build me a box", "Percy, can you build me a box",
      "Mercy → Percy with comma"),
@@ -97,7 +159,15 @@ def test_wake_word_normalization():
 # ============================================================================
 
 FULL_TRANSCRIPT_TESTS = [
-    # Wake-word + STT word fixes combined
+    # "Hey Percy" wake phrase + STT word fixes combined
+    ("hey mercy, bill me a box", "hey percy, build me a box",
+     "hey mercy + 'bill me' → 'build me'"),
+    ("hey see, make it yello", "hey percy, make it yellow",
+     "hey see + yello → yellow"),
+    ("a mercy bill me a ring", "hey percy, build me a ring",
+     "a mercy + bill me → build me"),
+    
+    # Legacy wake-word + STT word fixes combined
     ("Mercy, bill me a box", "percy, build me a box",
      "Mercy + 'bill me' → 'build me'"),
     ("See, can you make it yello", "can you make it yellow",
