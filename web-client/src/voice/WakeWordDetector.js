@@ -1,19 +1,26 @@
 /**
  * WakeWordDetector - Always-on local wake word detection using OpenWakeWord (ONNX)
  *
- * Uses a custom "Percy" wake word model. Falls back to Porcupine if OWW is blocked.
+ * Primary phrase: "Hey Percy" (two-word wake phrase for reliable detection).
+ * Secondary alias: bare "Percy" still accepted but "Hey Percy" is product wake.
+ * 
  * Idle = local KWS only (no network calls). On wake → callback fires.
- *
  * This runs entirely in the browser using Web Audio API + ONNX Runtime Web.
  */
 
 const FRAME_SIZE = 1280; // 80ms at 16kHz - matches OpenWakeWord expected input
 const SAMPLE_RATE = 16000;
-const DETECTION_THRESHOLD = 0.35; // Lowered from 0.5 for better sensitivity (Tabish)
-const TENTATIVE_THRESHOLD = 0.25; // Near-miss threshold for "almost heard Percy"
-const COOLDOWN_MS = 1200; // Reduced from 1500 to allow faster re-triggers (Tabish)
-const TENTATIVE_COOLDOWN_MS = 400; // Shorter cooldown for tentative signals
-const RETRY_WINDOW_MS = 2000; // Window to accumulate near-misses before retry signal
+
+// Tuned for "Hey Percy" two-word phrase detection
+// Higher threshold than single-word to reduce false positives
+const DETECTION_THRESHOLD = 0.42; // Tuned for "Hey Percy" - balances sensitivity vs false-positive
+const TENTATIVE_THRESHOLD = 0.30; // Near-miss threshold for "almost heard Hey Percy"
+const COOLDOWN_MS = 1000; // Reduced for faster re-triggers after clean wake
+const TENTATIVE_COOLDOWN_MS = 300; // Shorter cooldown for tentative signals
+const RETRY_WINDOW_MS = 2500; // Slightly longer window for multi-attempt wake detection
+
+// Score smoothing for noise rejection
+const SCORE_SMOOTHING_ALPHA = 0.3; // Exponential moving average: 0=no smoothing, 1=instant
 
 export class WakeWordDetector {
   constructor(onWakeWord, options = {}) {
@@ -32,6 +39,8 @@ export class WakeWordDetector {
     this.tentativeWindowStart = 0;
     this._audioBuffer = new Float32Array(0);
     this._useFallback = false;
+    this._smoothedScore = 0; // Exponential moving average for noise rejection
+    this._consecutiveHighFrames = 0; // Counter for sustained high-confidence detection
   }
 
   async start() {
@@ -63,7 +72,7 @@ export class WakeWordDetector {
     }
 
     this.running = true;
-    console.log("[Percy] Wake word detector started");
+    console.log("[Percy] Wake word detector started (wake phrase: 'Hey Percy')");
   }
 
   async _initOnnx() {
@@ -162,13 +171,31 @@ export class WakeWordDetector {
         ? await this._detectFallback(frame)
         : await this._detectOnnx(frame);
 
-      if (result.detected) {
+      // Apply exponential moving average smoothing for noise rejection
+      const rawScore = result.score || 0;
+      this._smoothedScore = SCORE_SMOOTHING_ALPHA * rawScore + 
+                            (1 - SCORE_SMOOTHING_ALPHA) * this._smoothedScore;
+
+      // Track consecutive high-confidence frames for reliable detection
+      if (this._smoothedScore > DETECTION_THRESHOLD) {
+        this._consecutiveHighFrames++;
+      } else if (this._smoothedScore < TENTATIVE_THRESHOLD) {
+        this._consecutiveHighFrames = 0;
+      }
+
+      // Clean wake: smoothed score above threshold with at least 2 consecutive high frames
+      // This prevents single-frame noise spikes from triggering false positives
+      const cleanWake = result.detected && this._consecutiveHighFrames >= 2;
+      
+      if (cleanWake) {
         this.lastDetection = now;
         this.tentativeCount = 0;
         this.tentativeWindowStart = 0;
-        console.log("[Percy] Wake word detected!");
+        this._consecutiveHighFrames = 0;
+        console.log(`[Percy] 'Hey Percy' detected! (score: ${this._smoothedScore.toFixed(3)})`);
         this.onWakeWord?.();
-      } else if (result.tentative) {
+      } else if (result.tentative || (result.detected && this._consecutiveHighFrames < 2)) {
+        // Tentative: near-threshold or single high frame (might be noise)
         if (now - this.lastTentative > TENTATIVE_COOLDOWN_MS) {
           this.lastTentative = now;
           
@@ -178,19 +205,21 @@ export class WakeWordDetector {
           
           if (now - this.tentativeWindowStart < RETRY_WINDOW_MS) {
             this.tentativeCount++;
-            console.log(`[Percy] Wake word tentative (score: ${result.score?.toFixed(3)}, count: ${this.tentativeCount})`);
-            this.onTentative?.(result.score);
+            console.log(`[Percy] Wake tentative (smoothed: ${this._smoothedScore.toFixed(3)}, raw: ${rawScore.toFixed(3)}, count: ${this.tentativeCount})`);
+            this.onTentative?.(this._smoothedScore);
             
+            // Multiple tentatives in window = user is trying, signal miss for retry hint
             if (this.tentativeCount >= 3) {
-              console.log("[Percy] Multiple near-misses detected, signaling retry");
+              console.log("[Percy] Multiple near-misses — say 'Hey Percy' clearly");
               this.onMiss?.();
               this.tentativeCount = 0;
               this.tentativeWindowStart = 0;
             }
           } else {
+            // Window expired, restart count
             this.tentativeCount = 1;
             this.tentativeWindowStart = now;
-            this.onTentative?.(result.score);
+            this.onTentative?.(this._smoothedScore);
           }
         }
       }
@@ -217,10 +246,12 @@ export class WakeWordDetector {
   }
 
   async _detectFallback(frame) {
+    // Energy-based fallback when ONNX model unavailable
+    // Tuned for "Hey Percy" two-word phrase (slightly higher thresholds for longer utterance)
     const sum = frame.reduce((a, b) => a + Math.abs(b), 0);
     const avg = sum / frame.length;
-    const detected = avg > 0.10; // Lowered from 0.15 for better fallback sensitivity (Tabish)
-    const tentative = avg > 0.07 && avg <= 0.10;
+    const detected = avg > 0.12; // Tuned for two-word phrase energy
+    const tentative = avg > 0.08 && avg <= 0.12;
     return { detected, tentative, score: avg };
   }
 

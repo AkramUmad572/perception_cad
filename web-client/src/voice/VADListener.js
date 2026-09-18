@@ -1,18 +1,20 @@
 /**
  * VADListener - Voice Activity Detection for post-wake listening window
  *
- * After wake word detection, opens a VAD-controlled listen window:
+ * After "Hey Percy" wake detection, opens a VAD-controlled listen window:
  * - Starts recording immediately
  * - Uses energy-based VAD to detect speech end
  * - Returns audio blob for STT handoff
  * - Auto-closes after timeout or silence
+ * 
+ * Tuned for natural "Hey Percy, make me a..." command flow.
  */
 
 const SAMPLE_RATE = 16000;
-const SILENCE_THRESHOLD = 0.008; // Lowered from 0.01 to be less aggressive at cutting
-const SILENCE_DURATION_MS = 1600; // Increased from 1200 to wait longer before cutting
-const MAX_LISTEN_MS = 15000; // Increased from 10000 for longer commands
-const MIN_AUDIO_MS = 600; // Increased from 400 to ensure we capture more speech
+const SILENCE_THRESHOLD = 0.006; // Lowered further - be patient with natural pauses
+const SILENCE_DURATION_MS = 1800; // Wait longer before cutting - "Hey Percy" commands have natural flow
+const MAX_LISTEN_MS = 18000; // Extended for longer voice commands
+const MIN_AUDIO_MS = 800; // Ensure we capture the full "Hey Percy, <command>" utterance
 
 export class VADListener {
   constructor() {
