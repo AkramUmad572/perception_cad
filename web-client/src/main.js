@@ -585,7 +585,7 @@ renderer.setAnimationLoop(() => {
     if (placeFrameCount >= 3) {
       placeModelInFrontOfUser(0.7);
       needsUserPlacement = false;
-      setStatus("Say 'Percy' to give a command. Pinch model to grab.", true);
+      setStatus("Say 'Hey Percy' to give a command. Pinch model to grab.", true);
     }
   }
 
@@ -680,7 +680,7 @@ fetch(`${API_BASE}/api/health`)
   .then((r) => r.json())
   .then((h) => {
     const status = `CadQuery ${h.cadquery ? "✓" : "✗"} · Voice ${h.stt && h.tts ? "✓" : "partial"}`;
-    setStatus(`Percy ready. Say 'Percy' to activate. ${status}`, true);
+    setStatus(`Percy ready. Say 'Hey Percy' to activate. ${status}`, true);
     percy.start();
   })
   .catch(() => {

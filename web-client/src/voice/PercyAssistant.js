@@ -37,7 +37,7 @@ export class PercyAssistant {
       await this.wakeDetector.start();
       this.started = true;
       voiceState.toIdle();
-      this.onStatusMessage("Percy ready. Say 'Percy' to activate.", true);
+      this.onStatusMessage("Percy ready. Say 'Hey Percy' to activate.", true);
     } catch (e) {
       console.error("[Percy] Failed to start:", e);
       voiceState.toError("Microphone access required");
@@ -59,11 +59,11 @@ export class PercyAssistant {
   _onWakeMiss() {
     if (voiceState.isMuted) return;
     voiceState.toWakeMiss();
-    this.onStatusMessage("Didn't quite catch that — say 'Percy' again", true);
+    this.onStatusMessage("Didn't quite catch that — say 'Hey Percy' again", true);
     setTimeout(() => {
       if (voiceState.isWakeMiss) {
         voiceState.toIdle();
-        this.onStatusMessage("Percy ready. Say 'Percy' to activate.", true);
+        this.onStatusMessage("Percy ready. Say 'Hey Percy' to activate.", true);
       }
     }, 1200);
   }
@@ -83,7 +83,7 @@ export class PercyAssistant {
     if (muted) {
       this.onStatusMessage("Percy muted", true);
     } else {
-      this.onStatusMessage("Percy unmuted. Say 'Percy' to activate.", true);
+      this.onStatusMessage("Percy unmuted. Say 'Hey Percy' to activate.", true);
     }
     return muted;
   }
@@ -107,7 +107,7 @@ export class PercyAssistant {
       const audioBlob = await this.vadListener.listen();
       if (!audioBlob) {
         voiceState.toIdle();
-        this.onStatusMessage("Didn't catch that. Say 'Percy' again.", true);
+        this.onStatusMessage("Didn't catch that. Say 'Hey Percy' again.", true);
         return;
       }
 
