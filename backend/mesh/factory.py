@@ -1,4 +1,4 @@
-"""Pick a mesh factory: three.ws (free) → NVIDIA TRELLIS → Meshy."""
+"""Pick a mesh factory: HF Space (free) → three.ws → NVIDIA TRELLIS → Meshy."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from mesh.cleanup import strip_base_plate
+from mesh.hf_space import generate_hf_space_glb
+from mesh.meshy import MeshBusyError
 from mesh.meshy import generate_mesh_glb as generate_meshy_glb
 from mesh.nvidia_trellis import generate_nvidia_glb
 from mesh.three_ws import generate_three_ws_glb, generate_three_ws_glb_from_image
@@ -47,16 +49,20 @@ def _note_nvidia_success() -> None:
 
 
 def mesh_ready(settings: Any) -> bool:
-    """True when at least one factory can run. three.ws is keyless."""
+    """True when at least one factory can run. HF Spaces and three.ws are keyless."""
     if getattr(settings, "meshy_api_key", ""):
         return True
     if getattr(settings, "nvidia_api_key", ""):
+        return True
+    if bool(getattr(settings, "hf_space_enabled", True)):
         return True
     return bool(getattr(settings, "three_ws_enabled", True))
 
 
 def mesh_providers(settings: Any) -> list[str]:
     names: list[str] = []
+    if bool(getattr(settings, "hf_space_enabled", True)):
+        names.append("hf_space")
     if bool(getattr(settings, "three_ws_enabled", True)):
         names.append("three_ws")
     if getattr(settings, "nvidia_api_key", ""):
@@ -71,41 +77,81 @@ async def generate_mesh_glb_from_image(
     output_dir: Path,
     *,
     prompt: str = "",
-    timeout_s: float = 240.0,
-    quality: str = "high",
+    timeout_s: float = 300.0,
+    quality: str = "draft",
+    image_path: Path | None = None,
+    hf_token: str = "",
+    hf_space: bool = True,
+    three_ws: bool = True,
 ) -> dict[str, Any]:
     """
-    Image-to-3D. three.ws is the only lane here: NVIDIA's hosted TRELLIS accepts
-    four fixed sample images, and Meshy image-to-3D needs a paid key.
+    Image-to-3D. Free photo lanes: Hugging Face TRELLIS Spaces first (we upload
+    the file, so their GPUs do not have to fetch our tunnel), then three.ws.
+    NVIDIA's hosted TRELLIS does not take arbitrary photos.
     """
     t0 = time.perf_counter()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_id = uuid.uuid4().hex[:12]
     dest = output_dir / f"{model_id}.glb"
+    errors: list[str] = []
+    busy = False
 
-    try:
-        meta = await generate_three_ws_glb_from_image(
-            image_url, dest, prompt=prompt, timeout_s=timeout_s, quality=quality
-        )
-    except Exception as exc:
-        logger.warning("three.ws image-to-3D failed: %s", exc)
-        dest.unlink(missing_ok=True)
-        return {
-            "ok": False,
-            "error": str(exc),
-            "error_type": "mesh",
-            "exec_ms": (time.perf_counter() - t0) * 1000,
-        }
+    local = Path(image_path) if image_path else None
+    if hf_space and local and local.exists():
+        try:
+            logger.info("Mesh factory: Hugging Face TRELLIS Space")
+            meta = await generate_hf_space_glb(
+                local, dest, token=hf_token, timeout_s=min(timeout_s, 240.0)
+            )
+            strip_base_plate(dest)
+            return {
+                "ok": True,
+                "model_id": model_id,
+                "glb_path": str(dest),
+                "exec_ms": (time.perf_counter() - t0) * 1000,
+                "textured": bool(meta.get("textured", True)),
+                "provider": "hf_space",
+            }
+        except MeshBusyError as exc:
+            logger.warning("HF Space busy: %s", exc)
+            busy = True
+            errors.append(f"hf_space: {exc}")
+            dest.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("HF Space image-to-3D failed: %s", exc)
+            errors.append(f"hf_space: {exc}")
+            dest.unlink(missing_ok=True)
 
-    strip_base_plate(dest)
+    if three_ws:
+        try:
+            meta = await generate_three_ws_glb_from_image(
+                image_url, dest, prompt=prompt, timeout_s=timeout_s, quality=quality
+            )
+            strip_base_plate(dest)
+            return {
+                "ok": True,
+                "model_id": model_id,
+                "glb_path": str(dest),
+                "exec_ms": (time.perf_counter() - t0) * 1000,
+                "textured": bool(meta.get("textured", True)),
+                "provider": "three_ws_image",
+            }
+        except MeshBusyError as exc:
+            logger.warning("three.ws image lane unavailable: %s", exc)
+            busy = True
+            errors.append(f"three.ws: {exc}")
+            dest.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("three.ws image-to-3D failed: %s", exc)
+            errors.append(f"three.ws: {exc}")
+            dest.unlink(missing_ok=True)
+
     return {
-        "ok": True,
-        "model_id": model_id,
-        "glb_path": str(dest),
+        "ok": False,
+        "error": " | ".join(errors) or "No image-to-3D factory available.",
+        "error_type": "busy" if busy else "mesh",
         "exec_ms": (time.perf_counter() - t0) * 1000,
-        "textured": bool(meta.get("textured", True)),
-        "provider": "three_ws_image",
     }
 
 

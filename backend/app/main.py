@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from ai.intent import parse_intent
+from app import jobs
 from app.config import get_settings
 from app.models import CommandRequest, CommandResponse, PhotoChooseRequest, ScriptRequest
 from app.pipeline import (
@@ -22,7 +23,7 @@ from app.pipeline import (
     confirm_chosen_photo,
     execute_script_direct,
 )
-from app.session import get_session
+from app.session import clear_session, get_session
 from mesh.refimage import isolate_subject
 from voice.speech import transcribe_audio
 
@@ -92,6 +93,13 @@ async def session_state(session_id: str = "default"):
     return get_session(session_id)
 
 
+@app.post("/api/session/{session_id}/reset")
+async def reset_session(session_id: str = "default"):
+    """Wipe the in-headset session so the next find-photo starts clean."""
+    clear_session(session_id)
+    return get_session(session_id)
+
+
 @app.post("/api/command", response_model=CommandResponse)
 async def command(body: CommandRequest):
     t_all = time.perf_counter()
@@ -147,7 +155,7 @@ async def image_to_3d(
     image: UploadFile = File(...),
     session_id: str = Form("default"),
     prompt: str = Form(""),
-    quality: str = Form("high"),
+    quality: str = Form("draft"),
 ):
     """
     Build a model from a reference photo.
@@ -187,21 +195,16 @@ async def image_to_3d(
 
         base = settings.public_base_url.rstrip("/")
         image_url = f"{base}/media/ref/{served}"
-        if base.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
-            return CommandResponse(
-                ok=False,
-                reply="Image-to-3D needs a public URL for the photo.",
-                action="clarify",
-                session=session,
-                error=(
-                    f"PUBLIC_BASE_URL is {base}; three.ws cannot fetch that. "
-                    "Point it at a tunnel or public host."
-                ),
-                latency_ms={"total_ms": (time.perf_counter() - t_all) * 1000},
-            )
+        # HF Spaces upload the local file. Only three.ws still needs a public URL.
 
+        local = settings.ref_dir / served
         result = await build_from_image(
-            image_url, session, settings, prompt=prompt, quality=quality
+            image_url,
+            session,
+            settings,
+            prompt=prompt,
+            quality=quality,
+            image_path=local if local.exists() else None,
         )
         result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
         return result
@@ -226,12 +229,71 @@ async def confirm_photo(body: PhotoChooseRequest):
 
 @app.post("/api/photos/choose", response_model=CommandResponse)
 async def choose_photo(body: PhotoChooseRequest):
-    """Build the Drive photo the user picked in AR."""
-    t_all = time.perf_counter()
+    """
+    Start building the Drive photo the user picked in AR.
+
+    Returns a job id immediately — the sculpt takes minutes, which is longer
+    than the connection between the headset and here reliably survives.
+    """
     session = get_session(body.session_id)
-    result = await build_chosen_photo(body.file_id, session, settings)
-    result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
-    return result
+    file_id = body.file_id
+    session_id = body.session_id
+
+    async def work() -> CommandResponse:
+        t_all = time.perf_counter()
+        result = await build_chosen_photo(file_id, get_session(session_id), settings)
+        result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
+        return result
+
+    return CommandResponse(
+        ok=True,
+        reply="Building that from your photo.",
+        action="building",
+        session=session,
+        backend="mesh",
+        job_id=jobs.start(work),
+    )
+
+
+@app.get("/api/jobs/{job_id}", response_model=CommandResponse)
+async def job_status(job_id: str, session_id: str = "default"):
+    """Poll a detached build. `action` stays "building" until it lands."""
+    session = get_session(session_id)
+    job = jobs.get(job_id)
+
+    if job is None:
+        return CommandResponse(
+            ok=False,
+            reply="That build is gone. Ask me to find the photo again.",
+            action="clarify",
+            session=session,
+            error=f"Unknown job {job_id}",
+        )
+
+    if job.result is not None:
+        job.result.job_id = job_id
+        return job.result
+
+    if job.done:
+        return CommandResponse(
+            ok=False,
+            reply="That build failed. Try again.",
+            action="clarify",
+            session=session,
+            error=job.error,
+            job_id=job_id,
+        )
+
+    # No reply_audio_url: a poll every few seconds must not talk over itself.
+    return CommandResponse(
+        ok=True,
+        reply="Still sculpting…",
+        action="building",
+        session=session,
+        backend="mesh",
+        job_id=job_id,
+        latency_ms={"elapsed_ms": job.elapsed_s * 1000},
+    )
 
 
 @app.post("/api/voice", response_model=CommandResponse)

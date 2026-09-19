@@ -137,6 +137,23 @@ class SecurityError(SandboxError):
     pass
 
 
+def _make_hex_color(real_color):
+    """
+    cq.Color that also takes "#RRGGBB".
+
+    CadQuery only accepts named colours or RGB floats, but hex is what the
+    codegen prompt asks for and what a photo's palette comes back as.
+    """
+
+    def Color(*args, **kwargs):
+        if len(args) == 1 and isinstance(args[0], str) and args[0].startswith("#"):
+            r, g, b = _hex_to_rgb(args[0])
+            return real_color(r / 255.0, g / 255.0, b / 255.0, 1.0)
+        return real_color(*args, **kwargs)
+
+    return Color
+
+
 class _SafeCadQueryProxy:
     """
     Thin proxy exposing only allowlisted CadQuery classes.
@@ -152,6 +169,8 @@ class _SafeCadQueryProxy:
         for attr in ALLOWED_CADQUERY_ATTRS:
             if hasattr(_real_cq, attr):
                 self._allowed[attr] = getattr(_real_cq, attr)
+        if "Color" in self._allowed:
+            self._allowed["Color"] = _make_hex_color(self._allowed["Color"])
 
     def __getattr__(self, name: str):
         if name in self._allowed:
@@ -251,12 +270,21 @@ def _is_assembly(obj) -> bool:
     )
 
 
-def _iter_assembly_nodes(node) -> list:
+def _iter_assembly_nodes(node, parent_loc=None) -> list:
+    """(node, world location) per solid, with parent transforms composed in."""
+    loc = getattr(node, "loc", None)
+    if parent_loc is None:
+        world = loc
+    elif loc is None:
+        world = parent_loc
+    else:
+        world = parent_loc * loc
+
     nodes = []
     if getattr(node, "obj", None) is not None:
-        nodes.append(node)
+        nodes.append((node, world))
     for child in getattr(node, "children", []) or []:
-        nodes.extend(_iter_assembly_nodes(child))
+        nodes.extend(_iter_assembly_nodes(child, world))
     return nodes
 
 
@@ -272,13 +300,15 @@ def _node_rgba(node, fallback: tuple[int, int, int, int] = (192, 192, 192, 255))
         return fallback
 
 
-def _shape_for_export(node):
+def _shape_for_export(node, world_loc=None):
     obj = node.obj
     shape = obj.val() if hasattr(obj, "val") else obj
-    loc = getattr(node, "loc", None)
-    if loc is not None and hasattr(shape, "located"):
+    # `located` REPLACES a shape's transform, so an identity assembly location
+    # dragged every part back to the origin. `moved` composes with what the
+    # script already baked in via .transformed(offset=...).
+    if world_loc is not None and hasattr(shape, "moved"):
         try:
-            shape = shape.located(loc)
+            shape = shape.moved(world_loc)
         except Exception:
             pass
     return shape
@@ -331,10 +361,10 @@ def _export_assembly(assy, out_glb: str) -> bool:
 
     scene = trimesh.Scene()
     used_names: set[str] = set()
-    for i, node in enumerate(nodes):
+    for i, (node, world_loc) in enumerate(nodes):
         stl_path = out_glb.replace(".glb", f"_p{i}.stl")
         try:
-            shape = _shape_for_export(node)
+            shape = _shape_for_export(node, world_loc)
             mesh = _export_solid(shape, stl_path)
             r, g, b, a = _node_rgba(node)
             mesh.visual.vertex_colors = [r, g, b, a]

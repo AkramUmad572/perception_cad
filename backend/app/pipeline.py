@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from ai.intent import extract_named_color
@@ -153,13 +154,15 @@ async def _execute_mesh(
     settings: Settings,
     latency: dict[str, float],
     size_mm: float | None = None,
+    use_nvidia: bool = True,
 ) -> tuple[bool, str | None, str | None, bool]:
     """Text-to-3D via three.ws / NVIDIA / Meshy. Never falls back to CadQuery."""
+    nvidia_key = getattr(settings, "nvidia_api_key", "") or ""
     result = await generate_mesh_glb(
         prompt=prompt,
         output_dir=settings.glb_dir,
         meshy_api_key=settings.meshy_api_key or "",
-        nvidia_api_key=getattr(settings, "nvidia_api_key", "") or "",
+        nvidia_api_key=nvidia_key if use_nvidia else "",
         three_ws=bool(getattr(settings, "three_ws_enabled", True)),
         timeout_s=150.0,
     )
@@ -509,26 +512,150 @@ async def apply_intent(
     )
 
 
+async def _cad_from_photo(
+    image_path: Path,
+    session: SessionState,
+    settings: Settings,
+    latency: dict[str, float],
+    hint: str = "",
+) -> tuple[bool, str | None, str | None]:
+    """Rebuild the photo's subject as CadQuery when the sculptors are down."""
+    from ai.intent import codegen_from_photo
+
+    t0 = time.perf_counter()
+    mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+    try:
+        intent = await codegen_from_photo(
+            image_path.read_bytes(), mime, settings, hint=hint
+        )
+    except Exception as exc:
+        logger.warning("Photo codegen failed: %s", exc)
+        return False, None, str(exc)
+    latency["photo_codegen_ms"] = (time.perf_counter() - t0) * 1000
+
+    if not intent.script:
+        return False, None, "Gemini returned no script for the photo."
+
+    session.scale = 1.0
+    success, model_id, error = await _execute_with_retry(
+        script=intent.script,
+        original_text=f"the object in the photo{f' ({hint})' if hint else ''}",
+        session=session,
+        settings=settings,
+        latency=latency,
+        flatten_color=False,
+    )
+    if success:
+        session.last_summary = intent.reply
+        save_session(session)
+    return success, model_id, error
+
+
 async def build_from_image(
     image_url: str,
     session: SessionState,
     settings: Settings,
     prompt: str = "",
     speak: bool = True,
-    quality: str = "high",
+    quality: str = "draft",
+    image_path: Path | None = None,
 ) -> CommandResponse:
     """Image-to-3D: a reference photo beats describing the object in words."""
     latency: dict[str, float] = {}
     t0 = time.perf_counter()
 
     result = await generate_mesh_glb_from_image(
-        image_url, settings.glb_dir, prompt=prompt, quality=quality
+        image_url,
+        settings.glb_dir,
+        prompt=prompt,
+        quality=quality,
+        image_path=image_path,
+        hf_token=getattr(settings, "hf_token", "") or "",
+        hf_space=bool(getattr(settings, "hf_space_enabled", True)),
+        three_ws=bool(getattr(settings, "three_ws_enabled", True)),
     )
     latency["mesh_ms"] = result.get("exec_ms", (time.perf_counter() - t0) * 1000)
 
     if not result.get("ok"):
         error = str(result.get("error") or "Image-to-3D failed.")
-        reply = "I couldn't build that from the photo."
+        logger.info("Photo lane unavailable (%s); trying text sculpt", error)
+
+        text_prompt = (prompt or "").strip()
+        if image_path and image_path.exists() and settings.gemini_api_key:
+            try:
+                from ai.intent import mesh_prompt_from_photo
+
+                mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+                text_prompt = await mesh_prompt_from_photo(
+                    image_path.read_bytes(), mime, settings, hint=prompt
+                )
+                latency["photo_describe_ms"] = (time.perf_counter() - t0) * 1000
+            except Exception as exc:
+                logger.warning("Photo describe failed: %s", exc)
+
+        if text_prompt:
+            ok, model_id, mesh_error, textured = await _execute_mesh(
+                text_prompt, session, settings, latency, use_nvidia=False
+            )
+            if ok:
+                reply = (
+                    "The photo engine was busy, so I sculpted it from "
+                    "what I saw in the picture."
+                )
+                audio_url, tts_ms = (
+                    await synthesize_speech(reply, settings) if speak else (None, 0)
+                )
+                latency["tts_ms"] = tts_ms
+                return CommandResponse(
+                    ok=True,
+                    reply=reply,
+                    action="generate",
+                    rebuilt=True,
+                    color=session.color,
+                    glb_url=session.glb_url,
+                    model_id=model_id,
+                    reply_audio_url=audio_url,
+                    session=session,
+                    latency_ms=latency,
+                    textured=textured,
+                    backend="mesh",
+                    display_size_m=_display_size_m(session),
+                )
+            error = f"{error} | text-sculpt: {mesh_error}"
+
+        logger.info("Text sculpt unavailable; trying CAD from the photo")
+
+        if image_path and image_path.exists():
+            ok, model_id, cad_error = await _cad_from_photo(
+                image_path, session, settings, latency, hint=prompt
+            )
+            if ok:
+                reply = "The sculptor was down, so I modelled it in CAD instead."
+                audio_url, tts_ms = (
+                    await synthesize_speech(reply, settings) if speak else (None, 0)
+                )
+                latency["tts_ms"] = tts_ms
+                return CommandResponse(
+                    ok=True,
+                    reply=reply,
+                    action="generate",
+                    rebuilt=True,
+                    color=session.color,
+                    glb_url=session.glb_url,
+                    model_id=model_id,
+                    reply_audio_url=audio_url,
+                    session=session,
+                    latency_ms=latency,
+                    textured=False,
+                    backend="cad",
+                    display_size_m=_display_size_m(session),
+                )
+            error = f"{error} | cad-from-photo: {cad_error}"
+
+        if result.get("error_type") == "busy":
+            reply = "The free sculpting service is down. Try again in a few minutes."
+        else:
+            reply = "I couldn't build that from the photo."
         audio_url, _ = await synthesize_speech(reply, settings) if speak else (None, 0)
         return CommandResponse(
             ok=False,
@@ -592,21 +719,16 @@ async def build_chosen_photo(
             backend="mesh",
         )
 
-    base = settings.public_base_url.rstrip("/")
-    if base.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
-        reply = "Image-to-3D needs the public tunnel running."
-        return CommandResponse(
-            ok=False,
-            reply=reply,
-            action="clarify",
-            session=session,
-            error=f"PUBLIC_BASE_URL is {base}",
-            backend="mesh",
-        )
-
     prompt = chosen.get("name") or ""
+    # The staged cut-out on disk, for the CAD fallback when sculpting is down.
+    local = settings.ref_dir / chosen["build_url"].rsplit("/", 1)[-1]
     return await build_from_image(
-        chosen["build_url"], session, settings, prompt=prompt, quality="high"
+        chosen["build_url"],
+        session,
+        settings,
+        prompt=prompt,
+        quality="draft",
+        image_path=local,
     )
 
 

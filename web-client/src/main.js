@@ -191,6 +191,17 @@ let grabbing = false;
 
 const photoPicker = new PhotoPicker(scene, () => camera);
 
+function buildFromPickedPhoto(fileId) {
+  photoPicker.keepOnly(fileId);
+  photoPicker.busy = true;
+  setStatus("Building that from the photo…", true);
+  // A sculpt that fails has to hand the picker back, or the photo can never
+  // be picked again without reloading the page.
+  percy.choosePhoto(fileId).then((result) => {
+    if (!result?.rebuilt) photoPicker.busy = false;
+  });
+}
+
 function placeModelInFrontOfUser(distance = 0.7) {
   const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
   cam.updateMatrixWorld(true);
@@ -648,12 +659,7 @@ function pollHand(handEntry, key) {
     }
     if (wasOpen && wasPinching[key]) {
       const picked = photoPicker.endPinch(pos);
-      if (picked) {
-        photoPicker.keepOnly(picked);
-        photoPicker.busy = true;
-        setStatus("Building that from the photo…", true);
-        percy.choosePhoto(picked);
-      }
+      if (picked) buildFromPickedPhoto(picked);
     }
     wasPinching[key] = isPinching;
     return;
@@ -706,12 +712,7 @@ right.controller.addEventListener("selectend", () => {
   if (photoPicker.isOpen) {
     right.controller.getWorldPosition(_pinch);
     const picked = photoPicker.endPinch(_pinch);
-    if (picked) {
-      photoPicker.keepOnly(picked);
-      photoPicker.busy = true;
-      setStatus("Building that from the photo…", true);
-      percy.choosePhoto(picked);
-    }
+    if (picked) buildFromPickedPhoto(picked);
     return;
   }
   if (grabSource === right.controller) endGrab();
@@ -812,12 +813,7 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     const hits = raycaster.intersectObjects(photoPicker.cards, true);
     const card = hits[0]?.object;
     const fileId = card?.userData?.fileId || card?.parent?.userData?.fileId;
-    if (fileId) {
-      photoPicker.keepOnly(fileId);
-      photoPicker.busy = true;
-      setStatus("Building that from the photo…", true);
-      percy.choosePhoto(fileId);
-    }
+    if (fileId) buildFromPickedPhoto(fileId);
     return;
   }
   const target = modelInteractTarget();
@@ -913,6 +909,7 @@ window.PerceptionCAD = {
   onVoiceStateChange: (callback) => voiceState.subscribe(callback),
   
   isGrabbing: () => grabbing,
+  placeModelInFrontOfUser,
   clearStaleGrabRefs: clearStaleGrabRefs,
   rebindGrabAfterMeshSwap: () => {
     if (grabbing && grabSource) {

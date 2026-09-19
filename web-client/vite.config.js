@@ -9,12 +9,14 @@ import { iwsdkDev } from "@iwsdk/vite-plugin-dev";
  *
  * Docs: https://developers.meta.com/horizon/documentation/web/webxr-overview/
  */
+// Longer than the client's own abort, so a slow build fails with a spoken
+// message instead of the proxy silently cutting the connection first.
 const proxyOpts = {
   target: "http://127.0.0.1:8000",
   changeOrigin: true,
   secure: false,
-  timeout: 120000,
-  proxyTimeout: 120000,
+  timeout: 300000,
+  proxyTimeout: 300000,
 };
 
 export default defineConfig({

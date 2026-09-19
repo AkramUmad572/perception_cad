@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     meshy_api_key: str = ""
     nvidia_api_key: str = ""
     three_ws_enabled: bool = True
+    # Optional free Hugging Face token. Raises ZeroGPU daily budget (~5 min).
+    hf_token: str = ""
+    hf_space_enabled: bool = True
 
     # Public Drive folder of demo photos. Empty = photo search is off.
     google_drive_api_key: str = ""

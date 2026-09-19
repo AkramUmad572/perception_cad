@@ -28,6 +28,10 @@ class MeshError(Exception):
     """Meshy task failed or was misconfigured."""
 
 
+class MeshBusyError(MeshError):
+    """Provider has no free capacity. Nothing is wrong with the request."""
+
+
 def _headers(api_key: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",

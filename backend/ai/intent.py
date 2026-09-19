@@ -56,6 +56,7 @@ Use matching names in the parts[] array.
 - import cadquery as cq (and math if needed). Valid Python only. Millimeters.
 - .extrude(height) ONLY — never extrude(..., centered=...). .box(l,w,h) may use centered=.
 - NO .cone() (does not exist). Tapered solids: loft two circles at an offset.
+- .transformed(offset=(x,y,z), rotate=(rx,ry,rz)) — the kwarg is `rotate`, NOT `rotation`.
 - OK: Workplane XY/XZ/YZ, Sketch, circle/rect/polygon/polyline/close/text, box/cylinder/sphere, extrude/loft/revolve/sweep, cut/hole/union/intersect, fillet/chamfer, transformed/offset, edges/faces/workplane/center, shell, Assembly, Color, Location, Vector.
 - FORBIDDEN: getattr/setattr/type/object/exec/eval/open/os/sys/network/importlib/pathlib/cq.occ_impl.
 
@@ -516,6 +517,35 @@ def _build_user_payload(
     return json.dumps(payload)
 
 
+# The script field carries Python, and roughly one generation in eight forgets
+# to escape the quotes in it — cq.Workplane("XZ") closes the JSON string early.
+_SCRIPT_OPEN_RE = re.compile(r'"script"\s*:\s*"')
+_FIELD_END_RE = re.compile(r'"\s*,\s*"[A-Za-z_][A-Za-z0-9_]*"\s*:|"\s*\}\s*$')
+
+
+def _repair_script_field(raw: str) -> dict | None:
+    """Re-escape a Python script that broke out of its JSON string."""
+    opening = _SCRIPT_OPEN_RE.search(raw)
+    if not opening:
+        return None
+    body_start = opening.end()
+    fallback = None
+    for end in _FIELD_END_RE.finditer(raw, body_start):
+        body = re.sub(r'(?<!\\)"', lambda _m: '\\"', raw[body_start : end.start()])
+        try:
+            parsed = json.loads(raw[:body_start] + body + raw[end.start() :])
+        except json.JSONDecodeError:
+            continue
+        # Several cut points can yield valid JSON; the one that leaves behind
+        # runnable Python is the real end of the field.
+        try:
+            compile(parsed.get("script") or "", "<codegen>", "exec")
+            return parsed
+        except SyntaxError:
+            fallback = fallback or parsed
+    return fallback
+
+
 def _parse_json_response(raw: str) -> dict:
     """Parse JSON from LLM response, handling markdown fences and trailing junk."""
     raw = raw.strip()
@@ -526,6 +556,10 @@ def _parse_json_response(raw: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        repaired = _repair_script_field(raw)
+        if repaired is not None:
+            logger.info("Recovered codegen JSON by re-escaping the script field")
+            return repaired
         start = raw.find("{")
         if start < 0:
             raise
@@ -619,6 +653,164 @@ async def _openai_codegen(
     raw = resp.choices[0].message.content or "{}"
     parsed = json.loads(raw)
     return Intent.model_validate(parsed)
+
+
+PHOTO_CODEGEN_PROMPT = """Build a 3D model of the object in this photo.
+
+Study its shape, proportions and colours, then write CadQuery that reproduces
+it as a solid object. Use an Assembly with one named, coloured part per visible
+feature, and take the hex colours from the photo itself.
+
+Model only the object — not the background, the surface it rests on, or any
+shadow. Reply with the same JSON contract as always."""
+
+PHOTO_MESH_PROMPT = """Look at this photo and describe the main object for a 3D sculptor.
+
+Reply JSON only:
+{"mesh_prompt":"short visual English of the isolated object, colors and pose, no background","reply":"Sculpting that."}
+
+No CadQuery. No pedestal, ground plane, or scene."""
+
+
+async def codegen_from_photo(
+    image: bytes,
+    mime: str,
+    settings: Settings,
+    hint: str = "",
+) -> Intent:
+    """
+    CadQuery script for whatever is in a photo, read by Gemini's vision.
+
+    The sculpting providers are a single point of failure for image-to-3D;
+    this reaches the same goal through the CAD path that already works.
+    """
+    import base64
+
+    import httpx
+
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required to build from a photo.")
+    if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        mime = "image/png"
+
+    instruction = PHOTO_CODEGEN_PROMPT
+    if hint.strip():
+        instruction += f"\n\nThe file is named {hint.strip()!r} — a hint, not a rule."
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.gemini_model}:generateContent"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": CODEGEN_SYSTEM_PROMPT}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": instruction},
+                    {
+                        "inline_data": {
+                            "mime_type": mime,
+                            "data": base64.b64encode(image).decode("ascii"),
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            url,
+            params={"key": settings.gemini_api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    raw = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "{}")
+    )
+    intent = Intent.model_validate(_parse_json_response(raw))
+    intent.backend = "cad"
+    return intent
+
+
+async def mesh_prompt_from_photo(
+    image: bytes,
+    mime: str,
+    settings: Settings,
+    hint: str = "",
+) -> str:
+    """
+    Short visual English for three.ws text-to-3D when the photo lane is down.
+
+    Image-to-3D on three.ws needs a healthy TRELLIS worker; the text lane
+    (`/api/3d/generate`) stays up. Gemini just tells it what the photo shows.
+    """
+    import base64
+
+    import httpx
+
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required to describe a photo.")
+    if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        mime = "image/png"
+
+    instruction = PHOTO_MESH_PROMPT
+    if hint.strip():
+        instruction += f"\n\nThe file is named {hint.strip()!r} — a hint, not a rule."
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.gemini_model}:generateContent"
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": instruction},
+                    {
+                        "inline_data": {
+                            "mime_type": mime,
+                            "data": base64.b64encode(image).decode("ascii"),
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            url,
+            params={"key": settings.gemini_api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    raw = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "{}")
+    )
+    parsed = _parse_json_response(raw)
+    prompt = ""
+    if isinstance(parsed, dict):
+        prompt = str(parsed.get("mesh_prompt") or parsed.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Gemini returned no mesh prompt for the photo.")
+    return prompt
 
 
 async def generate_code(

@@ -87,3 +87,5 @@ class CommandResponse(BaseModel):
     display_size_m: float | None = None
     # Drive photo matches for the AR picker. Empty unless action is find_photos.
     candidates: list[dict[str, Any]] = Field(default_factory=list)
+    # Set when the work runs detached; poll /api/jobs/{job_id} for the result.
+    job_id: str | None = None

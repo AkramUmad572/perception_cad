@@ -12,6 +12,14 @@ const SESSION_ID = "default";
 const READY_HINT =
   "Hold left trigger / pinch to talk. Right pinch the model to move it.";
 
+// Kept under the proxy's own limit so a stall surfaces here, with a message,
+// rather than as a severed connection.
+const REQUEST_TIMEOUT_MS = 180000;
+const JOB_POLL_MS = 3000;
+const JOB_MAX_MS = 600000;
+// Polls are cheap, so ride out a few dropped ones before giving up on a build.
+const JOB_MAX_MISSES = 5;
+
 export class PercyAssistant {
   constructor(options = {}) {
     this.onModelUpdate = options.onModelUpdate || (() => {});
@@ -110,26 +118,37 @@ export class PercyAssistant {
     }
   }
 
+  async _fetchJson(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  _postJson(url, body, timeoutMs) {
+    return this._fetchJson(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      timeoutMs
+    );
+  }
+
   async _sendVoice(blob) {
     const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
     const form = new FormData();
     form.append("audio", blob, `utterance.${ext}`);
     form.append("session_id", SESSION_ID);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 180000);
-
-    try {
-      const res = await fetch(`${API_BASE}/api/voice`, {
-        method: "POST",
-        body: form,
-        signal: controller.signal,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } finally {
-      clearTimeout(timer);
-    }
+    return this._fetchJson(`${API_BASE}/api/voice`, { method: "POST", body: form });
   }
 
   async sendTextCommand(text) {
@@ -139,21 +158,10 @@ export class PercyAssistant {
     this.onStatusMessage(`Looking that up… ("${text}")`, true);
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 180000);
-      let res;
-      try {
-        res = await fetch(`${API_BASE}/api/command`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, session_id: SESSION_ID }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const result = await res.json();
+      const result = await this._postJson(`${API_BASE}/api/command`, {
+        text,
+        session_id: SESSION_ID,
+      });
       await this._handleResponse(result);
       return result;
     } catch (e) {
@@ -169,43 +177,31 @@ export class PercyAssistant {
     this.onStatusMessage("Building that from the photo… this takes a bit.", true);
     try {
       try {
-        const confirmRes = await fetch(`${API_BASE}/api/photos/confirm`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file_id: fileId, session_id: SESSION_ID }),
-        });
-        if (confirmRes.ok) {
-          const confirm = await confirmRes.json();
-          if (confirm.reply) this.onStatusMessage(confirm.reply, true);
-          if (confirm.reply_audio_url) {
-            voiceState.toSpeaking();
-            if (this.replyAudio) {
-              try { this.replyAudio.pause(); } catch (_) {}
-            }
-            this.replyAudio = new Audio(confirm.reply_audio_url);
-            this.replyAudio.play().catch(() => {});
-            this.replyAudio.onended = () => {
-              if (voiceState.isSpeaking) voiceState.toThinking();
-            };
+        const confirm = await this._postJson(
+          `${API_BASE}/api/photos/confirm`,
+          { file_id: fileId, session_id: SESSION_ID },
+          30000
+        );
+        if (confirm.reply) this.onStatusMessage(confirm.reply, true);
+        if (confirm.reply_audio_url) {
+          voiceState.toSpeaking();
+          if (this.replyAudio) {
+            try { this.replyAudio.pause(); } catch (_) {}
           }
+          this.replyAudio = new Audio(confirm.reply_audio_url);
+          this.replyAudio.play().catch(() => {});
+          this.replyAudio.onended = () => {
+            if (voiceState.isSpeaking) voiceState.toThinking();
+          };
         }
       } catch (_) {}
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 180000);
-      let res;
-      try {
-        res = await fetch(`${API_BASE}/api/photos/choose`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file_id: fileId, session_id: SESSION_ID }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const result = await res.json();
+      const started = await this._postJson(
+        `${API_BASE}/api/photos/choose`,
+        { file_id: fileId, session_id: SESSION_ID },
+        30000
+      );
+      const result = started.job_id ? await this._awaitJob(started.job_id) : started;
       await this._handleResponse(result);
       return result;
     } catch (e) {
@@ -214,6 +210,28 @@ export class PercyAssistant {
       setTimeout(() => voiceState.toIdle(), 3000);
       return null;
     }
+  }
+
+  async _awaitJob(jobId) {
+    const url = `${API_BASE}/api/jobs/${jobId}?session_id=${SESSION_ID}`;
+    const deadline = Date.now() + JOB_MAX_MS;
+    let misses = 0;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, JOB_POLL_MS));
+      let data;
+      try {
+        data = await this._fetchJson(url, {}, 20000);
+      } catch (e) {
+        if (++misses > JOB_MAX_MISSES) throw e;
+        continue;
+      }
+      misses = 0;
+      if (data.action !== "building") return data;
+      const secs = Math.round((data.latency_ms?.elapsed_ms || 0) / 1000);
+      this.onStatusMessage(`Sculpting from your photo… ${secs}s`, true);
+    }
+    throw new Error("Build timed out");
   }
 
   async _handleResponse(data) {

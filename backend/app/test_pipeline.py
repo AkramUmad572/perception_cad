@@ -34,7 +34,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.models import Intent, SessionState, CommandResponse
-from app.pipeline import apply_intent
+from app.pipeline import apply_intent, build_from_image
 
 
 def _mock_settings():
@@ -46,6 +46,8 @@ def _mock_settings():
     settings.meshy_api_key = ""
     settings.nvidia_api_key = ""
     settings.three_ws_enabled = True
+    settings.hf_space_enabled = True
+    settings.hf_token = ""
     return settings
 
 
@@ -1026,6 +1028,53 @@ async def test_mesh_without_meshy_still_runs_factory():
     return 1, 0
 
 
+async def test_photo_falls_back_to_text_sculpt_before_cad():
+    """When Forge photo engines are down, sculpt from a description — not CAD."""
+    print("\n=== Test: Photo busy → text sculpt, not CAD ===")
+    session = SessionState(session_id="test")
+    settings = _mock_settings()
+    settings.gemini_api_key = "test-key"
+    photo = Path("/tmp/test_ref_pikachu.png")
+    photo.write_bytes(b"\x89PNG\r\n" + b"x" * 64)
+
+    with patch(
+        "app.pipeline.generate_mesh_glb_from_image",
+        new=AsyncMock(return_value={"ok": False, "error": "queued", "error_type": "busy"}),
+    ):
+        with patch(
+            "ai.intent.mesh_prompt_from_photo",
+            new=AsyncMock(return_value="a yellow Pikachu standing upright"),
+        ):
+            with patch("app.pipeline._execute_mesh") as mock_mesh:
+                mock_mesh.return_value = (True, "sculpt99", None, True)
+                with patch("app.pipeline._cad_from_photo") as mock_cad:
+                    with patch("app.pipeline.synthesize_speech") as mock_tts:
+                        mock_tts.return_value = (None, 0.0)
+                        with patch("app.pipeline.save_session"):
+                            result = await build_from_image(
+                                "https://example.com/p.png",
+                                session,
+                                settings,
+                                prompt="pikachu",
+                                speak=False,
+                                image_path=photo,
+                            )
+    errors = []
+    if mock_cad.called:
+        errors.append("must not fall through to CAD when text sculpt works")
+    if not mock_mesh.called:
+        errors.append("text sculpt should run")
+    if not result.ok or result.backend != "mesh" or result.model_id != "sculpt99":
+        errors.append(f"expected mesh sculpt, got ok={result.ok} backend={result.backend} id={result.model_id}")
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] photo lane fails over to three.ws text sculpt")
+    return 1, 0
+
+
 async def test_cad_generate_still_uses_sandbox():
     """CAD generate must not call Meshy."""
     print("\n=== Test: CAD generate still uses sandbox ===")
@@ -1135,6 +1184,10 @@ def run_all_tests():
         total_fail += f
 
         p, f = loop.run_until_complete(test_mesh_without_meshy_still_runs_factory())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_photo_falls_back_to_text_sculpt_before_cad())
         total_pass += p
         total_fail += f
 

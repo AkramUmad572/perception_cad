@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mesh.factory import generate_mesh_glb, mesh_ready
-from mesh.meshy import MeshError
+from mesh.factory import generate_mesh_glb, generate_mesh_glb_from_image, mesh_ready
+from mesh.meshy import MeshBusyError, MeshError
 
 
 def test_three_ws_first(tmp_path: Path) -> tuple[int, int]:
@@ -80,6 +80,62 @@ def test_mesh_ready_keyless() -> tuple[int, int]:
     return 0, 1
 
 
+def test_image_prefers_hf_space(tmp_path: Path) -> tuple[int, int]:
+    print("\n=== Test: image factory prefers HF Space ===")
+    photo = tmp_path / "ref.png"
+    photo.write_bytes(b"\x89PNG\r\n" + b"x" * 32)
+
+    async def fake_hf(image_path, dest, token="", timeout_s=240.0):
+        dest.write_bytes(b"glb-hf")
+        return {"ok": True, "textured": True, "provider": "hf_space"}
+
+    async def boom(*_a, **_k):
+        raise AssertionError("three.ws should not run when HF Space works")
+
+    with patch("mesh.factory.generate_hf_space_glb", fake_hf):
+        with patch("mesh.factory.generate_three_ws_glb_from_image", boom):
+            result = asyncio.run(
+                generate_mesh_glb_from_image(
+                    "https://example.com/p.png",
+                    tmp_path,
+                    image_path=photo,
+                )
+            )
+    if result.get("ok") and result.get("provider") == "hf_space":
+        print("  [ok] HF Space wins")
+        return 1, 0
+    print(f"  [FAIL] {result}")
+    return 0, 1
+
+
+def test_image_falls_back_to_three_ws(tmp_path: Path) -> tuple[int, int]:
+    print("\n=== Test: image factory falls back to three.ws ===")
+    photo = tmp_path / "ref.png"
+    photo.write_bytes(b"\x89PNG\r\n" + b"x" * 32)
+
+    async def busy_hf(*_a, **_k):
+        raise MeshBusyError("gpu quota")
+
+    async def fake_three(image_url, dest, prompt="", timeout_s=300.0, quality="draft"):
+        dest.write_bytes(b"glb-three")
+        return {"ok": True, "textured": True, "provider": "three_ws"}
+
+    with patch("mesh.factory.generate_hf_space_glb", busy_hf):
+        with patch("mesh.factory.generate_three_ws_glb_from_image", fake_three):
+            result = asyncio.run(
+                generate_mesh_glb_from_image(
+                    "https://example.com/p.png",
+                    tmp_path,
+                    image_path=photo,
+                )
+            )
+    if result.get("ok") and result.get("provider") == "three_ws_image":
+        print("  [ok] three.ws fallback")
+        return 1, 0
+    print(f"  [FAIL] {result}")
+    return 0, 1
+
+
 def run_all_tests() -> int:
     import tempfile
 
@@ -95,6 +151,12 @@ def run_all_tests() -> int:
         passed += p
         failed += f
         p, f = test_nvidia_when_three_ws_fails(Path(tmp))
+        passed += p
+        failed += f
+        p, f = test_image_prefers_hf_space(Path(tmp))
+        passed += p
+        failed += f
+        p, f = test_image_falls_back_to_three_ws(Path(tmp))
         passed += p
         failed += f
     print(f"\nTOTAL: {passed}/{passed + failed} passed")
